@@ -1,0 +1,21 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      # actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      # purcell/setup-emacs@master, pinned for reproducibility.
+      - uses: purcell/setup-emacs@bdc64dc730ae1fcba200bfd52cb1b4cf6159cbe5
+        with:
+          version: snapshot
+      - name: Compile, test, and run Checkdoc
+        run: make check
