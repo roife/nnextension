@@ -1,0 +1,886 @@
+;;; nnhackernews.el --- Read Hacker News through Gnus  -*- lexical-binding: t; -*-
+
+;; Copyright (C) 2026 nnextension contributors
+
+;; Author: nnextension contributors
+;; Version: 0.1.0
+;; Package-Requires: ((emacs "31.0"))
+;; Keywords: news, hypermedia
+;; URL: https://github.com/roife/nnextension
+;; SPDX-License-Identifier: GPL-3.0-or-later
+
+;; This file is not part of GNU Emacs.
+
+;;; Commentary:
+
+;; nnhackernews exposes recent Hacker News stories and their comments as
+;; threaded Gnus articles.  It is deliberately read-only.
+
+;;; Code:
+
+(require 'cl-lib)
+(require 'gnus)
+(require 'gnus-int)
+(require 'gnus-range)
+(require 'gnus-srvr)
+(require 'mail-parse)
+(require 'nnheader)
+(require 'nnoo)
+(require 'nnextension-core)
+(require 'seq)
+(require 'sqlite)
+(require 'subr-x)
+(require 'url-util)
+(require 'xml)
+
+(declare-function gnus-summary-article-number "gnus-sum")
+(declare-function gnus-summary-reselect-current-group "gnus-sum"
+                  (&optional all no-article))
+
+(defgroup nnhackernews nil
+  "Read Hacker News through Gnus."
+  :group 'gnus)
+
+(define-error 'nnhackernews-error "nnhackernews error")
+(define-error 'nnhackernews-http-error "Hacker News HTTP error"
+  'nnhackernews-error)
+
+(defmacro nnhackernews--with-report (&rest body)
+  "Run BODY, reporting errors through the Gnus backend."
+  (declare (indent 0) (debug t))
+  `(nnextension-core-with-report 'nnhackernews ,@body))
+
+(nnoo-declare nnhackernews)
+
+(defcustom nnhackernews-directory
+  (file-name-concat gnus-directory "nnhackernews")
+  "Directory in which nnhackernews stores its SQLite databases."
+  :type 'directory
+  :group 'nnhackernews)
+
+(defcustom nnhackernews-feed-limit 100
+  "Maximum number of current root stories retained from each feed scan."
+  :type '(integer 1)
+  :group 'nnhackernews)
+
+(defcustom nnhackernews-request-timeout 30
+  "Maximum number of seconds to wait for a Hacker News HTTP response."
+  :type 'natnum
+  :group 'nnhackernews)
+
+(defcustom nnhackernews-reply-subject-length 72
+  "Maximum number of characters in a comment body-derived subject."
+  :type '(integer 1)
+  :group 'nnhackernews)
+
+(dolist (variable '(nnhackernews-directory
+                    nnhackernews-feed-limit
+                    nnhackernews-request-timeout
+                    nnhackernews-reply-subject-length))
+  (nnoo-define variable nil))
+
+(defvoo nnhackernews--database nil)
+(defvoo nnhackernews--current-group nil)
+(defvoo nnhackernews-status-string "")
+
+(defconst nnhackernews--firebase-base-url
+  "https://hacker-news.firebaseio.com/v0")
+
+(defconst nnhackernews--algolia-base-url
+  "https://hn.algolia.com/api/v1")
+
+(defconst nnhackernews--site-url "https://news.ycombinator.com")
+
+(defconst nnhackernews--algolia-batch-size 50)
+
+(defconst nnhackernews--groups
+  '(("news" . "New Stories")
+    ("ask" . "Ask HN")
+    ("show" . "Show HN")
+    ("job" . "Jobs")))
+
+(defconst nnhackernews--item-columns
+  '(:id :group-name :article-no :story-id :parent-id :type :author
+    :created-at :title :text :url :score :descendants :deleted :dead
+    :fetched-at :thread-fetched-at))
+
+(defconst nnhackernews--item-select
+  "SELECT id, group_name, article_no, story_id, parent_id, type, author,
+          created_at, title, text, url, score, descendants, deleted, dead,
+          fetched_at, thread_fetched_at
+     FROM items WHERE ")
+
+(defvar-keymap nnhackernews-mode-map
+  :doc "Bindings active in nnhackernews Gnus buffers."
+  "C-c C-r" #'nnhackernews-refresh-thread)
+
+(define-minor-mode nnhackernews-mode
+  "Minor mode enabled in Gnus buffers backed by nnhackernews."
+  :lighter " HN"
+  :keymap nnhackernews-mode-map)
+
+(defun nnhackernews--database-file (server)
+  "Return the database file used for virtual SERVER."
+  (nnextension-core-database-file nnhackernews-directory server))
+
+(defun nnhackernews--initialize-database (database)
+  "Create the nnhackernews schema in DATABASE."
+  (nnextension-core-initialize-metadata database)
+  (sqlite-execute
+   database
+   "CREATE TABLE IF NOT EXISTS items (
+      id INTEGER PRIMARY KEY,
+      group_name TEXT NOT NULL,
+      article_no INTEGER NOT NULL,
+      story_id INTEGER NOT NULL,
+      parent_id INTEGER,
+      type TEXT NOT NULL,
+      author TEXT,
+      created_at INTEGER NOT NULL,
+      title TEXT,
+      text TEXT,
+      url TEXT,
+      score INTEGER,
+      descendants INTEGER,
+      deleted INTEGER NOT NULL DEFAULT 0,
+      dead INTEGER NOT NULL DEFAULT 0,
+      fetched_at INTEGER NOT NULL,
+      thread_fetched_at INTEGER,
+      UNIQUE(group_name, article_no)
+    )")
+  (sqlite-execute
+   database
+   "CREATE INDEX IF NOT EXISTS items_story_id
+       ON items(story_id)")
+  (sqlite-execute
+   database
+   "CREATE INDEX IF NOT EXISTS items_parent_id
+       ON items(parent_id)"))
+
+(defun nnhackernews--find-item (where values)
+  "Return the first cached item matching SQL WHERE with VALUES."
+  (when-let* ((row
+               (car
+                (sqlite-select
+                 nnhackernews--database
+                 (concat nnhackernews--item-select where)
+                 values))))
+    (cl-mapcan #'list nnhackernews--item-columns row)))
+
+(defun nnhackernews--item-by-id (id)
+  "Return the cached Hacker News item identified by ID."
+  (nnhackernews--find-item "id = ?" (vector id)))
+
+(defun nnhackernews--item-by-article (group article)
+  "Return the cached item for GROUP and local ARTICLE number."
+  (nnhackernews--find-item
+   "group_name = ? AND article_no = ?"
+   (vector group article)))
+
+(defun nnhackernews--next-article-number (group)
+  "Return the next dense local article number for GROUP."
+  (caar
+   (sqlite-select
+    nnhackernews--database
+    "SELECT COALESCE(MAX(article_no), 0) + 1
+       FROM items WHERE group_name = ?"
+    (vector group))))
+
+(defun nnhackernews--remote-id (item)
+  "Return ITEM's numeric Hacker News identifier."
+  (let ((id (or (plist-get item :id)
+                (plist-get item :objectID))))
+    (cond
+     ((integerp id) id)
+     ((stringp id) (string-to-number id))
+     (t nil))))
+
+(defun nnhackernews--tagged-p (item tag)
+  "Return non-nil when Algolia ITEM has TAG."
+  (member tag (plist-get item :_tags)))
+
+(defun nnhackernews--item-type (item)
+  "Return a normalized type string for remote ITEM."
+  (or (plist-get item :type)
+      (cond
+       ((nnhackernews--tagged-p item "job") "job")
+       ((nnhackernews--tagged-p item "story") "story")
+       (t "story"))))
+
+(defun nnhackernews--classify-story (item fallback)
+  "Classify root ITEM into a group, using FALLBACK when necessary."
+  (let ((title (or (plist-get item :title) "")))
+    (cond
+     ((or (equal (nnhackernews--item-type item) "job")
+          (nnhackernews--tagged-p item "job"))
+      "job")
+     ((or (nnhackernews--tagged-p item "ask_hn")
+          (string-match-p "\\`\\(?:Ask\\|Tell\\) HN\\(?:[: ]\\|\\'\\)"
+                          title))
+      "ask")
+     ((or (nnhackernews--tagged-p item "show_hn")
+          (string-match-p "\\`Show HN\\(?:[: ]\\|\\'\\)" title))
+      "show")
+     (t fallback))))
+
+(defun nnhackernews--normalize-item (item group story-id)
+  "Normalize remote ITEM for GROUP and STORY-ID."
+  (let* ((id (nnhackernews--remote-id item))
+         (type (nnhackernews--item-type item))
+         (root-p (not (equal type "comment")))
+         (author (or (plist-get item :author) (plist-get item :by)))
+         (text (or (plist-get item :text)
+                   (plist-get item :story_text)
+                   (plist-get item :comment_text)))
+         (deleted
+          (or (eq (plist-get item :deleted) t)
+              (and (equal type "comment")
+                   (null author) (string-empty-p (or text "")))))
+         (created-at
+          (or (plist-get item :created_at_i)
+              (plist-get item :time)
+              0)))
+    (list
+     :id id
+     :group-name (if root-p
+                     (nnhackernews--classify-story item group)
+                   group)
+     :story-id (or story-id
+                   (plist-get item :story_id)
+                   (and root-p id))
+     :parent-id (or (plist-get item :parent_id)
+                    (plist-get item :parent))
+     :type type
+     :author author
+     :created-at created-at
+     :title (plist-get item :title)
+     :text text
+     :url (plist-get item :url)
+     :score (or (plist-get item :points)
+                (plist-get item :score))
+     :descendants (or (plist-get item :num_comments)
+                      (plist-get item :descendants))
+     :deleted (if deleted 1 0)
+     :dead (if (eq (plist-get item :dead) t) 1 0))))
+
+(defun nnhackernews--upsert-item
+    (remote group story-id &optional thread-fetched-at)
+  "Insert or update REMOTE in GROUP for STORY-ID.
+THREAD-FETCHED-AT records completion of a root thread download."
+  (let* ((normalized (nnhackernews--normalize-item remote group story-id))
+         (id (plist-get normalized :id))
+         (existing (and id (nnhackernews--item-by-id id)))
+         (group (or (plist-get existing :group-name)
+                    (plist-get normalized :group-name)))
+         (article-no (or (plist-get existing :article-no)
+                         (nnhackernews--next-article-number group)))
+         (now (time-convert nil 'integer)))
+    (unless (and id (member group (mapcar #'car nnhackernews--groups)))
+      (signal 'nnhackernews-error '("Remote item lacks an ID or valid group")))
+    (sqlite-execute
+     nnhackernews--database
+     "INSERT INTO items
+        (id, group_name, article_no, story_id, parent_id, type, author,
+         created_at, title, text, url, score, descendants, deleted, dead,
+         fetched_at, thread_fetched_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        parent_id = COALESCE(excluded.parent_id, items.parent_id),
+        author = COALESCE(excluded.author, items.author),
+        created_at = CASE WHEN excluded.created_at = 0
+                          THEN items.created_at
+                          ELSE excluded.created_at END,
+        title = COALESCE(excluded.title, items.title),
+        text = COALESCE(excluded.text, items.text),
+        url = COALESCE(excluded.url, items.url),
+        score = COALESCE(excluded.score, items.score),
+        descendants = COALESCE(excluded.descendants, items.descendants),
+        deleted = excluded.deleted,
+        dead = excluded.dead,
+        fetched_at = excluded.fetched_at,
+        thread_fetched_at = COALESCE(excluded.thread_fetched_at,
+                                     items.thread_fetched_at)"
+     (vector
+      id group article-no (plist-get normalized :story-id)
+      (plist-get normalized :parent-id) (plist-get normalized :type)
+      (plist-get normalized :author) (plist-get normalized :created-at)
+      (plist-get normalized :title) (plist-get normalized :text)
+      (plist-get normalized :url) (plist-get normalized :score)
+      (plist-get normalized :descendants) (plist-get normalized :deleted)
+      (plist-get normalized :dead) now thread-fetched-at))
+    (nnhackernews--item-by-id id)))
+
+(defun nnhackernews--json-error-message (data fallback)
+  "Extract an error message from JSON DATA, or return FALLBACK."
+  (or (plist-get data :message)
+      (plist-get data :error)
+      fallback))
+
+(defun nnhackernews--request (url)
+  "Return parsed JSON retrieved from URL."
+  (nnextension-core-json-request
+   "GET" url
+   :headers '(("User-Agent" . "nnextension-nnhackernews/0.1"))
+   :timeout nnhackernews-request-timeout
+   :error-type 'nnhackernews-http-error
+   :service "Hacker News"
+   :error-message-function #'nnhackernews--json-error-message))
+
+(defun nnhackernews--firebase-request (path)
+  "Return parsed Firebase JSON at PATH."
+  (nnhackernews--request
+   (format "%s/%s.json" nnhackernews--firebase-base-url path)))
+
+(defun nnhackernews--algolia-request (path &optional query)
+  "Return parsed Algolia JSON at PATH with optional QUERY alist."
+  (nnhackernews--request
+   (concat nnhackernews--algolia-base-url path
+           (and query (concat "?" (url-build-query-string query))))))
+
+(defun nnhackernews--chunks (items size)
+  "Split ITEMS into lists of at most SIZE elements."
+  (let (chunks)
+    (while items
+      (push (seq-take items size) chunks)
+      (setq items (nthcdr size items)))
+    (nreverse chunks)))
+
+(defun nnhackernews--algolia-story-hits (ids)
+  "Return Algolia story search hits matching IDS."
+  (cl-mapcan
+   (lambda (chunk)
+     (let ((tags
+            (format
+             "story,(%s)"
+             (mapconcat
+              (lambda (id) (format "story_%d" id)) chunk ","))))
+       (plist-get
+        (nnhackernews--algolia-request
+         "/search_by_date"
+         `(("tags" ,tags)
+           ("hitsPerPage" ,(number-to-string (length chunk)))))
+        :hits)))
+   (nnhackernews--chunks ids nnhackernews--algolia-batch-size)))
+
+(defun nnhackernews--algolia-job-hits ()
+  "Return the recent Algolia job hits needed for the configured window."
+  (plist-get
+   (nnhackernews--algolia-request
+    "/search_by_date"
+    `(("tags" "job")
+      ("hitsPerPage" ,(number-to-string nnhackernews-feed-limit))))
+   :hits))
+
+(defun nnhackernews--fetch-root-items (group ids)
+  "Return remote root items for GROUP in official feed IDS order."
+  (let* ((hits (if (equal group "job")
+                   (nnhackernews--algolia-job-hits)
+                 (nnhackernews--algolia-story-hits ids)))
+         (by-id (make-hash-table :test #'eql)))
+    (dolist (hit hits)
+      (puthash (nnhackernews--remote-id hit) hit by-id))
+    (delq
+     nil
+     (mapcar
+      (lambda (id)
+        (or (gethash id by-id)
+            (nnhackernews--firebase-request (format "item/%d" id))))
+      ids))))
+
+(defun nnhackernews--id-table (&rest lists)
+  "Return an eql hash table containing every ID in LISTS."
+  (let ((table (make-hash-table :test #'eql)))
+    (dolist (list lists)
+      (dolist (id list)
+        (puthash id t table)))
+    table))
+
+(defun nnhackernews--fetch-news-roots (ids)
+  "Return up to `nnhackernews-feed-limit' ordinary roots from IDS."
+  (let (roots)
+    (while (and ids (< (length roots) nnhackernews-feed-limit))
+      (let ((chunk (seq-take ids nnhackernews--algolia-batch-size)))
+        (setq ids (nthcdr nnhackernews--algolia-batch-size ids))
+        (dolist (root (nnhackernews--fetch-root-items "news" chunk))
+          (when (and (< (length roots) nnhackernews-feed-limit)
+                     (equal (nnhackernews--classify-story root "news")
+                            "news"))
+            (push root roots)))))
+    (nreverse roots)))
+
+(defun nnhackernews--sync-stories ()
+  "Synchronize current story roots for all Hacker News groups."
+  (let* ((new-ids (nnhackernews--firebase-request "newstories"))
+         (ask-ids (nnhackernews--firebase-request "askstories"))
+         (show-ids (nnhackernews--firebase-request "showstories"))
+         (job-ids (nnhackernews--firebase-request "jobstories"))
+         (special (nnhackernews--id-table ask-ids show-ids job-ids))
+         (feeds
+          `(("ask" . ,(seq-take ask-ids nnhackernews-feed-limit))
+            ("show" . ,(seq-take show-ids nnhackernews-feed-limit))
+            ("job" . ,(seq-take job-ids nnhackernews-feed-limit))))
+         roots)
+    (dolist
+        (root
+         (nnhackernews--fetch-news-roots
+          (seq-remove (lambda (id) (gethash id special)) new-ids)))
+      (push (cons "news" root) roots))
+    (dolist (feed feeds)
+      (dolist (root (nnhackernews--fetch-root-items (car feed) (cdr feed)))
+        (push (cons (car feed) root) roots)))
+    (setq roots
+          (seq-sort-by
+           (lambda (entry)
+             (let ((item (cdr entry)))
+               (cons (or (plist-get item :created_at_i)
+                         (plist-get item :time) 0)
+                     (or (nnhackernews--remote-id item) 0))))
+           (lambda (left right)
+             (or (< (car left) (car right))
+                 (and (= (car left) (car right))
+                      (< (cdr left) (cdr right)))))
+           roots))
+    (with-sqlite-transaction nnhackernews--database
+      (dolist (entry roots)
+        (nnhackernews--upsert-item
+         (cdr entry) (car entry) (nnhackernews--remote-id (cdr entry)))))
+    (nnextension-core-metadata-set
+     nnhackernews--database "last_story_sync"
+     (time-convert nil 'integer))
+    (length roots)))
+
+(defun nnhackernews--flatten-thread (root)
+  "Return ROOT and its recursive Algolia children as a flat list."
+  (cons root
+        (cl-mapcan #'nnhackernews--flatten-thread
+                   (plist-get root :children))))
+
+(defun nnhackernews--visible-count (story-id)
+  "Return the number of visible cached items in STORY-ID."
+  (caar
+   (sqlite-select
+    nnhackernews--database
+    "SELECT COUNT(*) FROM items
+      WHERE story_id = ? AND deleted = 0 AND dead = 0"
+    (vector story-id))))
+
+(defun nnhackernews--sync-thread (story-id)
+  "Synchronize STORY-ID from Algolia and return newly visible item count."
+  (let* ((cached-root (or (nnhackernews--item-by-id story-id)
+                          (error "No cached Hacker News story %s" story-id)))
+         (group (plist-get cached-root :group-name))
+         (remote
+          (nnhackernews--algolia-request (format "/items/%d" story-id)))
+         (remote-id (nnhackernews--remote-id remote))
+         (before (nnhackernews--visible-count story-id))
+         (now (time-convert nil 'integer)))
+    (unless (= (or remote-id -1) story-id)
+      (signal 'nnhackernews-error
+              (list (format "Algolia did not return story %d" story-id))))
+    (let ((items
+           (seq-sort-by
+            (lambda (item)
+              (cons (or (plist-get item :created_at_i) 0)
+                    (or (nnhackernews--remote-id item) 0)))
+            (lambda (left right)
+              (or (< (car left) (car right))
+                  (and (= (car left) (car right))
+                       (< (cdr left) (cdr right)))))
+            (nnhackernews--flatten-thread remote))))
+      (with-sqlite-transaction nnhackernews--database
+        (dolist (item items)
+          (nnhackernews--upsert-item
+           item group story-id
+           (and (= (nnhackernews--remote-id item) story-id) now)))))
+    (max 0 (- (nnhackernews--visible-count story-id) before))))
+
+(defun nnhackernews--message-id (id)
+  "Return a stable message ID for Hacker News ID."
+  (format "<%d@ycombinator.com>" id))
+
+(defun nnhackernews--item-from-message-id (message-id)
+  "Return the cached item matching MESSAGE-ID."
+  (when (string-match "\\`<\\([0-9]+\\)@ycombinator\\.com>\\'" message-id)
+    (nnhackernews--item-by-id
+     (string-to-number (match-string 1 message-id)))))
+
+(defun nnhackernews--visible-p (item)
+  "Return non-nil when ITEM should appear as a Gnus article."
+  (and item
+       (= (plist-get item :deleted) 0)
+       (= (plist-get item :dead) 0)))
+
+(defun nnhackernews--references (item)
+  "Return visible ancestor message IDs for ITEM."
+  (let ((parent-id (plist-get item :parent-id))
+        ancestors)
+    (while parent-id
+      (let ((parent (nnhackernews--item-by-id parent-id)))
+        (unless parent
+          (setq parent-id nil))
+        (when parent
+          (when (nnhackernews--visible-p parent)
+            (push (nnhackernews--message-id parent-id) ancestors))
+          (setq parent-id (plist-get parent :parent-id)))))
+    (string-join ancestors " ")))
+
+(defun nnhackernews--permalink (item)
+  "Return the Hacker News permalink for ITEM."
+  (format "%s/item?id=%d" nnhackernews--site-url (plist-get item :id)))
+
+(defun nnhackernews--body-text (item)
+  "Return compact plain text from ITEM's HTML body."
+  (nnextension-core-html-to-text (plist-get item :text)))
+
+(defun nnhackernews--subject (item)
+  "Return the story title or a body-derived comment subject for ITEM."
+  (if (not (equal (plist-get item :type) "comment"))
+      (nnextension-core-sanitize-header
+       (or (plist-get item :title) "Untitled Hacker News story"))
+    (let ((body
+           (nnextension-core-sanitize-header
+            (nnhackernews--body-text item))))
+      (cond
+       ((string-empty-p body) "Deleted Hacker News comment")
+       ((<= (length body) nnhackernews-reply-subject-length) body)
+       (t
+        (let ((excerpt
+               (string-trim-right
+                (substring body 0 nnhackernews-reply-subject-length))))
+          (when
+              (and
+               (string-match
+                "\\`\\(.+\\)[[:space:]][^[:space:]]*\\'" excerpt)
+               (> (length (match-string 1 excerpt))
+                  (/ nnhackernews-reply-subject-length 2)))
+            (setq excerpt (match-string 1 excerpt)))
+          (concat excerpt "…")))))))
+
+(defun nnhackernews--make-header (item)
+  "Create a Gnus mail header from cached ITEM."
+  (when (nnhackernews--visible-p item)
+    (make-full-mail-header
+     (plist-get item :article-no)
+     (nnhackernews--subject item)
+     (nnextension-core-mail-from
+      (plist-get item :author) "news.ycombinator.com")
+     (format-time-string
+      "%a, %d %b %Y %T %z"
+      (seconds-to-time (plist-get item :created-at)))
+     (nnhackernews--message-id (plist-get item :id))
+     (nnhackernews--references item)
+     (length (or (plist-get item :text) ""))
+     (string-lines (or (plist-get item :text) ""))
+     nil
+     `((X-Hacker-News-ID . ,(number-to-string (plist-get item :id)))
+       (X-Hacker-News-Story-ID
+        . ,(number-to-string (plist-get item :story-id)))
+       (X-Hacker-News-Score
+        . ,(number-to-string (or (plist-get item :score) 0)))
+       (X-Hacker-News-Comments
+        . ,(number-to-string (or (plist-get item :descendants) 0)))
+       (Archived-At . ,(nnhackernews--permalink item))))))
+
+(defun nnhackernews--story-html (item)
+  "Return the summary HTML used to display root story ITEM."
+  (let* ((title (xml-escape-string (nnhackernews--subject item)))
+         (author
+          (xml-escape-string (or (plist-get item :author) "unknown")))
+         (permalink (xml-escape-string (nnhackernews--permalink item)))
+         (external (plist-get item :url))
+         (text (plist-get item :text)))
+    (concat
+     "<article><h1>" title "</h1>\n"
+     "<p>By " author " · "
+     (number-to-string (or (plist-get item :score) 0)) " points · "
+     (number-to-string (or (plist-get item :descendants) 0))
+     " comments</p>\n"
+     (unless (string-empty-p (or text ""))
+       (concat "<section>" text "</section>\n"))
+     "<p>"
+     (when (not (string-empty-p (or external "")))
+       (format "<a href=\"%s\">Open original article</a> · "
+               (xml-escape-string external)))
+     (format "<a href=\"%s\">View on Hacker News</a></p></article>"
+             permalink))))
+
+(defun nnhackernews--article-html (item)
+  "Return display HTML for ITEM."
+  (if (equal (plist-get item :type) "comment")
+      (or (plist-get item :text) "<p>This comment has no available body.</p>")
+    (nnhackernews--story-html item)))
+
+(defun nnhackernews--group-stats (group)
+  "Return visible article count, minimum, and maximum for GROUP."
+  (car
+   (sqlite-select
+    nnhackernews--database
+    "SELECT COUNT(*), COALESCE(MIN(article_no), 1),
+            COALESCE(MAX(article_no), 0)
+       FROM items
+      WHERE group_name = ? AND deleted = 0 AND dead = 0"
+    (vector group))))
+
+(defun nnhackernews--possibly-open (server)
+  "Select and, if necessary, open SERVER."
+  (let ((server (or server (nnoo-current-server 'nnhackernews))))
+    (unless server
+      (error "No nnhackernews server selected"))
+    (unless (and (nnoo-current-server-p 'nnhackernews server)
+                 (sqlitep nnhackernews--database))
+      (unless (nnhackernews-open-server server)
+        (error "Could not open nnhackernews server %s" server)))
+    server))
+
+(nnoo-define-basics nnhackernews)
+
+(deffoo nnhackernews-open-server (server &optional defs)
+  "Open virtual SERVER using Gnus server definitions DEFS."
+  (condition-case err
+      (progn
+        (nnoo-change-server 'nnhackernews server defs)
+        (unless (sqlitep nnhackernews--database)
+          (make-directory nnhackernews-directory t)
+          (setq nnhackernews--database
+                (sqlite-open (nnhackernews--database-file server)))
+          (nnhackernews--initialize-database nnhackernews--database))
+        (nnheader-report 'nnhackernews "Opened Hacker News")
+        t)
+    (error
+     (when (sqlitep nnhackernews--database)
+       (sqlite-close nnhackernews--database)
+       (setq nnhackernews--database nil))
+     (nnheader-report 'nnhackernews "%s" (error-message-string err))
+     nil)))
+
+(deffoo nnhackernews-server-opened (&optional server)
+  "Return non-nil when SERVER is the open nnhackernews server."
+  (and (nnoo-current-server-p
+        'nnhackernews
+        (or server (nnoo-current-server 'nnhackernews)))
+       (sqlitep nnhackernews--database)))
+
+(deffoo nnhackernews-close-server (&optional server _defs)
+  "Close SERVER and its database."
+  (when (nnhackernews-server-opened server)
+    (sqlite-close nnhackernews--database)
+    (setq nnhackernews--database nil))
+  (nnoo-close-server 'nnhackernews server))
+
+(deffoo nnhackernews-close-group (_group &optional _server)
+  "Close the current nnhackernews group."
+  (setq nnhackernews--current-group nil)
+  t)
+
+(deffoo nnhackernews-request-close ()
+  "Close all nnhackernews resources."
+  (nnhackernews-close-server))
+
+(deffoo nnhackernews-request-type (_group &optional _article)
+  "Return the nnhackernews article type."
+  'news)
+
+(deffoo nnhackernews-status-message (&optional _server)
+  "Return the latest nnhackernews status string."
+  nnhackernews-status-string)
+
+(deffoo nnhackernews-request-list (&optional server)
+  "Insert the active Hacker News group list for SERVER."
+  (nnhackernews--with-report
+    (nnhackernews--possibly-open server)
+    (with-current-buffer nntp-server-buffer
+      (erase-buffer)
+      (dolist (entry nnhackernews--groups)
+        (pcase-let ((`(,count ,minimum ,maximum)
+                     (nnhackernews--group-stats (car entry))))
+          (ignore count)
+          (insert (format "%s %d %d y\n"
+                          (car entry) maximum minimum)))))
+    t))
+
+(deffoo nnhackernews-request-list-newsgroups (&optional server)
+  "Insert friendly Hacker News group descriptions for SERVER."
+  (nnhackernews--with-report
+    (nnhackernews--possibly-open server)
+    (with-current-buffer nntp-server-buffer
+      (erase-buffer)
+      (dolist (entry nnhackernews--groups)
+        (insert (format "%s\t%s\n" (car entry) (cdr entry)))))
+    t))
+
+(deffoo nnhackernews-retrieve-groups (_groups &optional server)
+  "Retrieve active Hacker News data for SERVER."
+  (and (nnhackernews-request-list server) 'active))
+
+(deffoo nnhackernews-request-newgroups (_date &optional server)
+  "Insert every static Hacker News group for SERVER."
+  (nnhackernews-request-list server))
+
+(deffoo nnhackernews-request-group
+    (group &optional server _dont-check _info)
+  "Select GROUP on SERVER."
+  (nnhackernews--with-report
+    (nnhackernews--possibly-open server)
+    (unless (assoc group nnhackernews--groups)
+      (error "Invalid nnhackernews group %s" group))
+    (setq nnhackernews--current-group group)
+    (pcase-let ((`(,count ,minimum ,maximum)
+                 (nnhackernews--group-stats group)))
+      (nnheader-insert "211 %d %d %d %s\n"
+                       count minimum maximum group))
+    t))
+
+(deffoo nnhackernews-request-scan (&optional _group server)
+  "Fetch current Hacker News story roots for SERVER."
+  (nnhackernews--with-report
+    (nnhackernews--possibly-open server)
+    (let ((count (nnhackernews--sync-stories)))
+      (setq nnhackernews-status-string
+            (format "Synchronized %d Hacker News stories" count))
+      (nnheader-report 'nnhackernews "%s" nnhackernews-status-string))
+    t))
+
+(deffoo nnhackernews-request-group-scan
+    (_group &optional server _info)
+  "Scan a Hacker News group on SERVER."
+  (nnhackernews-request-scan nil server))
+
+(deffoo nnhackernews-retrieve-headers
+    (articles &optional group server _fetch-old)
+  "Insert NOV data for ARTICLES in GROUP on SERVER."
+  (nnhackernews--with-report
+    (nnhackernews--possibly-open server)
+    (setq group (or group nnhackernews--current-group))
+    (with-current-buffer nntp-server-buffer
+      (erase-buffer)
+      (dolist (article (gnus-uncompress-sequence articles))
+        (when-let* ((item (nnhackernews--item-by-article group article))
+                    (header (nnhackernews--make-header item)))
+          (nnheader-insert-nov header))))
+    'nov))
+
+(defun nnhackernews--schedule-reselect (group)
+  "Schedule a summary reselect for GROUP after article display finishes."
+  (when (and (boundp 'gnus-summary-buffer)
+             (buffer-live-p gnus-summary-buffer))
+    (let ((summary gnus-summary-buffer))
+      (run-at-time
+       0 nil
+       (lambda ()
+         (when (buffer-live-p summary)
+           (with-current-buffer summary
+             (when (equal (gnus-group-real-name gnus-newsgroup-name) group)
+               (gnus-summary-reselect-current-group t nil)))))))))
+
+(deffoo nnhackernews-request-article
+    (article &optional group server buffer)
+  "Retrieve ARTICLE from GROUP on SERVER into BUFFER."
+  (nnhackernews--with-report
+    (nnhackernews--possibly-open server)
+    (setq group (or group nnhackernews--current-group))
+    (let* ((item
+            (if (stringp article)
+                (nnhackernews--item-from-message-id article)
+              (nnhackernews--item-by-article group article)))
+           (root-p (and item (equal (plist-get item :type) "story"))))
+      (unless item
+        (error "No such Hacker News article: %s" article))
+      (when (and root-p (null (plist-get item :thread-fetched-at)))
+        (condition-case err
+            (let ((new (nnhackernews--sync-thread (plist-get item :story-id))))
+              (setq item (nnhackernews--item-by-id (plist-get item :id)))
+              (when (> new 0)
+                (nnhackernews--schedule-reselect group)))
+          (error
+           (nnheader-message
+            3 "nnhackernews: could not load comments: %s"
+            (error-message-string err)))))
+      (let* ((header (nnhackernews--make-header item))
+             (permalink (nnhackernews--permalink item)))
+        (unless header
+          (error "Hacker News article is deleted: %s" article))
+        (with-current-buffer (or buffer nntp-server-buffer)
+          (erase-buffer)
+          (insert "Newsgroups: " group "\n"
+                  "Subject: " (mail-header-subject header) "\n"
+                  "From: " (mail-header-from header) "\n"
+                  "Date: " (mail-header-date header) "\n"
+                  "Message-ID: " (mail-header-id header) "\n")
+          (unless (string-empty-p (mail-header-references header))
+            (insert "References: " (mail-header-references header) "\n"))
+          (insert "Archived-At: " permalink "\n"
+                  "X-Hacker-News-ID: "
+                  (number-to-string (plist-get item :id)) "\n"
+                  "X-Hacker-News-Story-ID: "
+                  (number-to-string (plist-get item :story-id)) "\n"
+                  "X-Hacker-News-Score: "
+                  (number-to-string (or (plist-get item :score) 0)) "\n"
+                  "X-Hacker-News-Comments: "
+                  (number-to-string (or (plist-get item :descendants) 0))
+                  "\nMIME-Version: 1.0\n"
+                  "Content-Type: text/html; charset=utf-8\n"
+                  "Content-Transfer-Encoding: 8bit\n"
+                  "Content-Base: " permalink "\n\n"
+                  "<html><head><base href=\""
+                  nnhackernews--site-url
+                  "/\"></head><body>\n"
+                  (nnhackernews--article-html item)
+                  "\n</body></html>\n"))
+        (cons group (plist-get item :article-no))))))
+
+(defun nnhackernews--current-location ()
+  "Return (SERVER GROUP ARTICLE SUMMARY-BUFFER) at point."
+  (let (group article summary)
+    (cond
+     ((derived-mode-p 'gnus-summary-mode)
+      (setq group gnus-newsgroup-name
+            article (gnus-summary-article-number)
+            summary (current-buffer)))
+     (gnus-article-current
+      (setq group (car gnus-article-current)
+            article (cdr gnus-article-current)
+            summary gnus-summary-buffer))
+     (t (user-error "No Gnus article at point")))
+    (let ((method (gnus-find-method-for-group group)))
+      (unless (eq (car method) 'nnhackernews)
+        (user-error "Current article is not from nnhackernews"))
+      (list (cadr method) (gnus-group-real-name group) article summary))))
+
+;;;###autoload
+(defun nnhackernews-refresh-thread ()
+  "Refresh the Hacker News thread containing the article at point."
+  (interactive)
+  (pcase-let* ((`(,server ,group ,article ,summary)
+                (nnhackernews--current-location)))
+    (nnhackernews--possibly-open server)
+    (let* ((item (or (nnhackernews--item-by-article group article)
+                     (user-error "No cached Hacker News item at point")))
+           (story-id (plist-get item :story-id))
+           (new (nnhackernews--sync-thread story-id)))
+      (message "Refreshed Hacker News thread; %d new articles" new)
+      (when (buffer-live-p summary)
+        (with-current-buffer summary
+          (gnus-summary-reselect-current-group t nil))))))
+
+(defun nnhackernews--current-group-p ()
+  "Return non-nil when the current Gnus buffer uses nnhackernews."
+  (let ((group (if (derived-mode-p 'gnus-summary-mode)
+                   gnus-newsgroup-name
+                 (car gnus-article-current))))
+    (and group
+         (eq (car-safe (gnus-find-method-for-group group))
+             'nnhackernews))))
+
+(defun nnhackernews--activate-mode ()
+  "Update `nnhackernews-mode' for the current Gnus group."
+  (nnhackernews-mode (if (nnhackernews--current-group-p) 1 -1)))
+
+(add-hook 'gnus-summary-mode-hook #'nnhackernews--activate-mode)
+(add-hook 'gnus-article-prepare-hook #'nnhackernews--activate-mode)
+
+(nnoo-define-skeleton nnhackernews)
+(gnus-declare-backend "nnhackernews" 'none)
+
+(provide 'nnhackernews)
+
+;;; nnhackernews.el ends here

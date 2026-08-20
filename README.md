@@ -1,33 +1,78 @@
-# nndiscourse
+# nnextension
 
-`nndiscourse` is a Gnus backend for [Discourse](https://www.discourse.org/)
-forums. It presents:
+`nnextension` packages Gnus backends for web communities:
 
-- Discourse categories as Gnus groups;
-- posts as threaded articles;
-- topic creation and replies through normal Gnus message composition;
-- post editing and deletion;
-- likes and topic notification levels.
+- `nndiscourse` presents Discourse categories and posts through Gnus and
+  supports the existing authenticated write operations;
+- `nnhackernews` presents Hacker News stories and comments as a strictly
+  read-only backend.
 
-The package targets Emacs 31. It uses the built-in Gnus, URL, JSON, SQLite,
-MIME, and `auth-source` libraries. Browser-based User API Key authorization
-also requires the `openssl` executable.
+The package targets Emacs 31 and uses only built-in Emacs libraries for Gnus,
+URL, JSON, SQLite, MIME, `auth-source`, and HTML rendering. Browser-based
+Discourse User API Key authorization also requires the `openssl` executable.
 
 ## Installation
 
-Until the package is available from MELPA, clone the repository and add it
-to `load-path`:
+Clone the repository and add it to `load-path`:
 
 ```elisp
-(add-to-list 'load-path "/path/to/nndiscourse")
-(require 'nndiscourse)
+(add-to-list 'load-path "/path/to/nnextension")
+(require 'nnextension)
 ```
+
+`nnextension` loads both backends. Existing configurations may continue to
+load either backend independently with `(require 'nndiscourse)` or
+`(require 'nnhackernews)`.
+
+## Hacker News
+
+Add the read-only server to an existing Gnus configuration:
+
+```elisp
+(add-to-list 'gnus-secondary-select-methods '(nnhackernews ""))
+```
+
+Run `M-x gnus`, show the server buffer with `^`, browse the nnhackernews
+server, and subscribe to any of these groups:
+
+| Group | Contents |
+| --- | --- |
+| `news` | New stories other than Ask HN, Show HN, and jobs |
+| `ask` | Ask HN stories |
+| `show` | Show HN stories |
+| `job` | Job stories |
+
+The initial scan retains the latest 100 roots from each feed by default.
+Customize `nnhackernews-feed-limit` to change that window. Article-number
+mappings are persistent and never change when scores, comment counts, or
+feed positions change.
+
+Opening a story for the first time downloads its complete comment tree and
+reselects the current Gnus summary so the comments appear as threaded
+articles. Normal Gnus refreshes update story roots but deliberately do not
+poll previously opened comment trees. Use `C-c C-r` in a nnhackernews summary
+or article buffer to refresh the current thread manually.
+
+Root articles show the Hacker News self text, score, comment count, permalink,
+and original article link. External pages are not downloaded into Emacs.
+There is no authentication and no support for submissions, replies, votes,
+editing, deletion, or expiry.
+
+The backend uses the official
+[Hacker News Firebase API](https://github.com/HackerNews/API) for feed
+membership, the [Algolia HN API](https://hn.algolia.com/api) for batched story
+metadata and recursive comment trees, and the official item endpoint when a
+new root has not reached Algolia yet. Its implementation is new, with the
+original [dickmao/nnhackernews](https://github.com/dickmao/nnhackernews)
+serving as a behavioral reference.
+
+## Discourse
 
 A `use-package` setup for a forum looks like this:
 
 ```elisp
-(use-package nndiscourse
-  :load-path "/path/to/nndiscourse"
+(use-package nnextension
+  :load-path "/path/to/nnextension"
   :config
   (add-to-list
    'gnus-secondary-select-methods
@@ -36,27 +81,14 @@ A `use-package` setup for a forum looks like this:
      (nndiscourse-auth-type auto))))
 ```
 
-The first string is a Gnus virtual-server name. It does not have to match
-the hostname. When `nndiscourse-base-url` is omitted, the virtual-server
-name is treated as an HTTPS hostname:
-
-```elisp
-(add-to-list 'gnus-secondary-select-methods
-             '(nndiscourse "forum.example"))
-```
-
-Run `M-x gnus`, show the server buffer with `^`, browse the nndiscourse
-server, and subscribe to the desired `category.<id>` groups. Gnus shows
-the corresponding category names alongside these stable internal names.
-
-## Authentication
+The first string is a Gnus virtual-server name. It does not have to match the
+hostname. When `nndiscourse-base-url` is omitted, the virtual-server name is
+treated as an HTTPS hostname.
 
 Public forums can be read without credentials. Authenticated operations use
 the HTTP authentication schemes supported by the
-[Discourse API](https://docs.discourse.org/).
-
-Store credentials in an `auth-source` backend, preferably
-`~/.authinfo.gpg`, rather than in Emacs configuration:
+[Discourse API](https://docs.discourse.org/). Store credentials in an
+`auth-source` backend, preferably `~/.authinfo.gpg`:
 
 ```text
 machine forum.example port discourse login alice password API_KEY
@@ -64,101 +96,57 @@ machine forum.example port discourse login alice password API_KEY
 
 The available `nndiscourse-auth-type` values are:
 
-- `auto` (default): read anonymously without an entry; treat a
-  `user-api-key` login as a User API Key and any other entry as
-  `Api-Key` plus `Api-Username`;
+- `auto` (default): read anonymously without an entry; infer the credential
+  type when an entry is present;
 - `anonymous`: never consult `auth-source`;
-- `api-key`: use the entry's login and secret as `Api-Username` and
-  `Api-Key`;
-- `user-api-key`: find the `user-api-key` login in
-  `nndiscourse-auth-source-file` and send its secret as `User-Api-Key`.
+- `api-key`: send `Api-Username` and `Api-Key`;
+- `user-api-key`: read the `user-api-key` login and send `User-Api-Key`.
 
-For a normal Discourse user account, configure `user-api-key` and run:
+For a normal Discourse account, configure `user-api-key` and run
+`M-x nndiscourse-authorize`. The command opens the forum authorization page,
+verifies the returned payload, and stores the key in
+`nndiscourse-auth-source-file`.
 
-```text
-M-x nndiscourse-authorize
-```
-
-The command opens the forum's authorization page. Log in through the browser,
-approve the requested write access, click **Copy API Key**, then paste the
-encrypted payload into Emacs. `nndiscourse` verifies and decrypts it, stores
-the resulting key in `nndiscourse-auth-source-file` (default
-`~/.authinfo.gpg`), and deletes the temporary RSA private key.
-
-For a pre-provisioned User API Key, use this exact login:
-
-```text
-machine forum.example port discourse login user-api-key password USER_API_KEY
-```
-
-Then configure `(nndiscourse-auth-type user-api-key)`.
-
-Secrets are neither written to the SQLite cache nor included in diagnostic
-messages.
-
-## Gnus usage
-
-Normal Gnus commands perform the core operations:
-
-| Command | Action |
-| --- | --- |
-| `a` | Create a topic in the current category |
-| `f` | Reply to the selected post |
-| `F` | Reply and quote the selected post |
-| `e` | Edit an editable post as raw Markdown |
-| `E` | Mark a post as expirable |
-| `B DEL` | Delete a post immediately |
-| `M-g` | Synchronize new posts |
-
-The `nndiscourse-mode` minor mode adds:
+Normal Gnus commands create topics, reply, edit, and delete when the account
+has permission. `nndiscourse-mode` additionally provides:
 
 | Command | Action |
 | --- | --- |
 | `C-c C-l` | Like or unlike the current post |
-| `C-c C-n` | Set muted, normal, tracking, or watching for the topic |
-| `C-c C-o` | Fetch one older page; a numeric prefix fetches more pages |
+| `C-c C-n` | Change the topic notification level |
+| `C-c C-o` | Fetch one or more older pages |
 
-Add `%uH` to `gnus-summary-line-format` and alias
-`gnus-user-format-function-H` to `nndiscourse-summary-liked-mark` to display
-`♥` on posts liked by the current user.  The mark updates immediately after
-`C-c C-l`.  nndiscourse also observes Discourse's per-post `can_act` and
-`can_undo` flags, so forbidden likes and expired unlike windows are reported
-before a request is sent.
+The nnextension refactor preserves the existing `nndiscourse-*` public
+variables, commands, backend method, SQLite location, authentication behavior,
+and persistent article numbers.
 
-Gnus expiry behaves like a mail backend. A forced delete is immediate.
-Routine expiry only deletes posts marked expirable and old enough under the
-group's `expiry-wait` setting. Discourse permission checks still apply.
+## Storage
 
-The initial synchronization downloads the latest 500 accessible posts by
-default. Customize `nndiscourse-initial-sync-limit` before first opening a
-server to change that window. Article-number mappings and synchronization
-cursors are persistent, so restarts do not renumber articles.
+Each backend keeps its own SQLite databases beneath the corresponding Gnus
+directory:
 
-Topic-starting posts use the Discourse topic title as their Gnus subject.
-Replies use a compact, plain-text excerpt of their rendered body so that
-individual responses remain identifiable in the summary buffer. Customize
-`nndiscourse-reply-subject-length` to change the default 72-character limit.
+- `nndiscourse-directory` continues to default to
+  `gnus-directory/nndiscourse`;
+- `nnhackernews-directory` defaults to `gnus-directory/nnhackernews`.
 
-## Current boundaries
-
-This release does not implement private messages, uploads or attachments,
-flags, bookmarks, moderation, tag/category administration, remote Discourse
-read-state synchronization, or topic-title editing. Message composition
-accepts a single plain-text Markdown part and rejects multipart messages.
+The databases contain public remote content, synchronization metadata, and
+stable local article mappings. Authentication secrets are never stored in
+SQLite or included in diagnostics.
 
 ## Development
 
-Run the deterministic ERT suite and byte compilation with:
+Run byte compilation, deterministic ERT tests, and Checkdoc with:
 
 ```sh
 make check
 ```
 
-The tests use in-memory SQLite databases and mocked HTTP responses. An
-optional read-only smoke test can be run against a public forum:
+The ERT suites use in-memory SQLite databases and mocked HTTP responses.
+Optional read-only network smoke tests are available:
 
 ```sh
-make smoke URL=https://meta.discourse.org
+make smoke-discourse URL=https://meta.discourse.org
+make smoke-hackernews
 ```
 
 Maintainers with `package-lint` installed can also run:

@@ -1,12 +1,12 @@
 ;;; nndiscourse.el --- Gnus backend for Discourse forums  -*- lexical-binding: t; -*-
 
-;; Copyright (C) 2026 nndiscourse contributors
+;; Copyright (C) 2026 nnextension contributors
 
-;; Author: nndiscourse contributors
+;; Author: nnextension contributors
 ;; Version: 0.1.0
 ;; Package-Requires: ((emacs "31.0"))
 ;; Keywords: news, hypermedia
-;; URL: https://github.com/roifewu/nndiscourse
+;; URL: https://github.com/roife/nnextension
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 
 ;; This file is not part of GNU Emacs.
@@ -47,6 +47,7 @@
 (require 'nnheader)
 (require 'nnmail)
 (require 'nnoo)
+(require 'nnextension-core)
 (require 'seq)
 (require 'shr)
 (require 'sqlite)
@@ -77,11 +78,7 @@
 (defmacro nndiscourse--with-report (&rest body)
   "Run BODY, reporting errors through the Gnus backend."
   (declare (indent 0) (debug t))
-  `(condition-case err
-       (progn ,@body)
-     (error
-      (nnheader-report 'nndiscourse "%s" (error-message-string err))
-      nil)))
+  `(nnextension-core-with-report 'nndiscourse ,@body))
 
 (nnoo-declare nndiscourse)
 
@@ -189,7 +186,7 @@ Valid values are `auto', `anonymous', `api-key', and `user-api-key'.")
 
 (defun nndiscourse--sanitize-header (value)
   "Return VALUE without characters that can inject a mail header."
-  (replace-regexp-in-string "[\r\n]+" " " (or value "") t t))
+  (nnextension-core-sanitize-header value))
 
 (defun nndiscourse--normalize-base-url (server)
   "Return the normalized base URL for SERVER."
@@ -203,29 +200,15 @@ Valid values are `auto', `anonymous', `api-key', and `user-api-key'.")
 
 (defun nndiscourse--database-file (server)
   "Return the database file used for virtual SERVER."
-  (file-name-concat nndiscourse-directory
-                    (concat (secure-hash 'sha256 server) ".sqlite")))
+  (nnextension-core-database-file nndiscourse-directory server))
 
 (defun nndiscourse--ensure-column (database table column declaration)
   "Ensure TABLE in DATABASE has COLUMN with SQL DECLARATION."
-  (unless
-      (seq-some
-       (lambda (row) (equal (nth 1 row) column))
-       (sqlite-select database (format "PRAGMA table_info(%s)" table)))
-    (sqlite-execute
-     database
-     (format "ALTER TABLE %s ADD COLUMN %s %s"
-             table column declaration))))
+  (nnextension-core-ensure-column database table column declaration))
 
 (defun nndiscourse--initialize-database (database)
   "Create the nndiscourse schema in DATABASE."
-  (sqlite-execute database "PRAGMA journal_mode = WAL")
-  (sqlite-execute
-   database
-   "CREATE TABLE IF NOT EXISTS metadata (
-      key TEXT PRIMARY KEY,
-      value TEXT
-    )")
+  (nnextension-core-initialize-metadata database)
   (sqlite-execute
    database
    "CREATE TABLE IF NOT EXISTS categories (
@@ -283,17 +266,11 @@ Valid values are `auto', `anonymous', `api-key', and `user-api-key'.")
 
 (defun nndiscourse--metadata-get (key)
   "Return the current database metadata value for KEY."
-  (caar (sqlite-select nndiscourse--database
-                       "SELECT value FROM metadata WHERE key = ?"
-                       (vector key))))
+  (nnextension-core-metadata-get nndiscourse--database key))
 
 (defun nndiscourse--metadata-set (key value)
   "Set current database metadata KEY to VALUE."
-  (sqlite-execute
-   nndiscourse--database
-   "INSERT INTO metadata(key, value) VALUES(?, ?)
-    ON CONFLICT(key) DO UPDATE SET value = excluded.value"
-   (vector key (format "%s" value))))
+  (nnextension-core-metadata-set nndiscourse--database key value))
 
 (defun nndiscourse--user-api-client-id ()
   "Return the persistent User API client ID, or nil without a database."
@@ -588,91 +565,26 @@ back into Emacs, and store the resulting User API Key with auth-source."
      ((plist-get data :error))
      (t fallback))))
 
-(defun nndiscourse--encode-http-headers (headers)
-  "Encode the names and values in HEADERS as unibyte UTF-8 strings."
-  (mapcar
-   (lambda (header)
-     (cons (encode-coding-string (car header) 'utf-8)
-           (encode-coding-string (cdr header) 'utf-8)))
-   headers))
-
-(defun nndiscourse--request-error-message
-    (method path error-data auth-headers)
-  "Return a safe request error for METHOD, PATH and ERROR-DATA.
-Redact values from AUTH-HEADERS and discard multiline request data."
-  (let ((detail
-         (or (car
-              (split-string
-               (error-message-string error-data) "[\r\n]" t))
-             "unknown error")))
-    (dolist (header auth-headers)
-      (when (not (string-empty-p (cdr header)))
-        (setq detail
-              (replace-regexp-in-string
-               (regexp-quote (cdr header)) "<redacted>" detail t t))))
-    (format "Could not send %s %s: %s" method path detail)))
-
 (cl-defun nndiscourse--request
     (method path &key data authenticated)
   "Send METHOD to PATH and return parsed JSON.
 DATA is encoded as JSON.  When AUTHENTICATED is non-nil, fail before
 the request if no credentials are configured."
-  (let* ((auth-headers (nndiscourse--auth-headers))
-         (url-request-method method)
-         (url-request-data
-          (and data (encode-coding-string (json-serialize data) 'utf-8)))
-         (url-request-extra-headers
-          (nndiscourse--encode-http-headers
-           (append '(("Accept" . "application/json")
-                     ("User-Agent" . "nndiscourse/0.1"))
-                   (and data '(("Content-Type" . "application/json")))
-                   auth-headers)))
-         (url (concat nndiscourse-base-url path))
-         buffer)
+  (let ((auth-headers (nndiscourse--auth-headers)))
     (when (and authenticated (null auth-headers))
       (signal 'nndiscourse-error
               '("Authentication is required for this operation")))
-    (setq buffer
-          (condition-case err
-              (url-retrieve-synchronously
-               url t t nndiscourse-request-timeout)
-            (error
-             (signal
-              'nndiscourse-http-error
-              (list
-               0
-               (nndiscourse--request-error-message
-                method path err auth-headers))))))
-    (unless buffer
-      (signal 'nndiscourse-http-error
-              (list 0 (format "Timed out requesting %s" url))))
-    (unwind-protect
-        (with-current-buffer buffer
-          (let ((status url-http-response-status)
-                parsed)
-            (goto-char url-http-end-of-headers)
-            (skip-chars-forward "\r\n")
-            (unless (eobp)
-              (condition-case nil
-                  (setq parsed
-                        (json-parse-buffer
-                         :object-type 'plist
-                         :array-type 'list
-                         :null-object nil
-                         :false-object :false))
-                (json-parse-error
-                 (when (and (>= status 200) (< status 300))
-                   (signal 'nndiscourse-http-error
-                           (list status "Discourse returned malformed JSON"))))))
-            (if (and (>= status 200) (< status 300))
-                parsed
-              (signal
-               'nndiscourse-http-error
-               (list status
-                     (nndiscourse--json-error-message
-                      parsed
-                      (format "Discourse returned HTTP %s" status)))))))
-      (kill-buffer buffer))))
+    (nnextension-core-json-request
+     method (concat nndiscourse-base-url path)
+     :data data
+     :headers (append '(("User-Agent" . "nndiscourse/0.1"))
+                      auth-headers)
+     :timeout nndiscourse-request-timeout
+     :error-type 'nndiscourse-http-error
+     :service "Discourse"
+     :error-message-function #'nndiscourse--json-error-message
+     :sensitive-values (mapcar #'cdr auth-headers)
+     :request-target path)))
 
 (defun nndiscourse--category-list (categories)
   "Flatten CATEGORIES and their nested subcategory lists."
@@ -982,18 +894,10 @@ CONTEXT supplies values omitted by single-post API responses."
 
 (defun nndiscourse--from (post)
   "Return a mail-style From value for POST."
-  (let* ((username
-          (nndiscourse--sanitize-header
-           (or (plist-get post :username) "")))
-         (username (if (string-empty-p username) "unknown" username))
-         (display
-          (nndiscourse--sanitize-header
-           (or (plist-get post :display-name) "")))
-         (display (if (string-empty-p display) username display)))
-    (format "\"%s\" <%s@%s>"
-            (replace-regexp-in-string "[\"\\\\]" "\\\\\\&" display)
-            username
-            (nndiscourse--server-host))))
+  (nnextension-core-mail-from
+   (plist-get post :username)
+   (nndiscourse--server-host)
+   (plist-get post :display-name)))
 
 (defun nndiscourse--body-text (post)
   "Return POST's rendered body as compact plain text."
@@ -1002,33 +906,7 @@ CONTEXT supplies values omitted by single-post API responses."
         (string-trim
          (replace-regexp-in-string
           "[[:space:]]+" " " (or (plist-get post :raw) "")))
-      (condition-case nil
-          (with-temp-buffer
-            (insert cooked)
-            (let ((dom (libxml-parse-html-region (point-min) (point-max))))
-              (dolist (class '("quote" "meta"))
-                (dolist
-                    (node
-                     (dom-by-class
-                      dom
-                      (format
-                       "\\(?:^\\|[[:space:]]\\)%s\\(?:$\\|[[:space:]]\\)"
-                       class)))
-                  (dom-remove-node dom node)))
-              (erase-buffer)
-              (let ((shr-inhibit-images t)
-                    (shr-use-colors nil)
-                    (shr-use-fonts nil)
-                    (shr-width 10000))
-                (shr-insert-document dom))
-              (string-trim
-               (replace-regexp-in-string
-                "[[:space:]]+" " " (buffer-string)))))
-        (error
-         (string-trim
-          (replace-regexp-in-string
-           "[[:space:]]+" " "
-           (replace-regexp-in-string "<[^>]+>" " " cooked))))))))
+      (nnextension-core-html-to-text cooked '("quote" "meta")))))
 
 (defun nndiscourse--subject (post)
   "Return the topic title or a body-derived reply subject for POST."
