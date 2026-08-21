@@ -31,34 +31,51 @@
       (delete-directory directory t))))
 
 (defun nnextension-smoke-hackernews ()
-  "Read recent Hacker News roots and one comment thread."
-  (let ((nnhackernews--database (sqlite-open))
-        (nnhackernews-feed-limit 2))
+  "Read recent Hacker News roots and one paginated comment batch."
+  (let* ((directory (make-temp-file "nnextension-hn-smoke-" t))
+         (nnhackernews-directory directory)
+         (file (nnextension-core-database-file directory ""))
+         (nnhackernews--database (sqlite-open file))
+         (nnhackernews-feed-limit 2)
+         story-id roots header comments)
     (unwind-protect
         (progn
           (nnhackernews--initialize-database nnhackernews--database)
-          (let* ((roots (nnhackernews--sync-stories))
-                 (story-id
-                  (caar
-                   (sqlite-select
-                    nnhackernews--database
-                    "SELECT id FROM items
-                      WHERE type != 'comment'
-                      ORDER BY descendants DESC, id DESC LIMIT 1"))))
-            (unless (and story-id (> roots 0))
-              (error "Hacker News smoke test returned no stories"))
-            (let* ((new (nnhackernews--sync-thread story-id))
-                   (root (nnhackernews--item-by-id story-id))
-                   (header (nnhackernews--make-header root)))
-              (unless (and header
-                           (equal (mail-header-id header)
-                                  (nnhackernews--message-id story-id)))
-                (error "Hacker News smoke test produced an invalid header"))
-              (princ
-               (format "Hacker News smoke: %d roots, story %d, %d comments\n"
-                       roots story-id new)))))
+          (setq roots (nnhackernews--sync-stories)
+                story-id
+                (caar
+                 (sqlite-select
+                  nnhackernews--database
+                  "SELECT id FROM items
+                    WHERE type != 'comment'
+                    ORDER BY descendants DESC, id DESC LIMIT 1"))
+                header (nnhackernews--make-header
+                        (nnhackernews--item-by-id story-id)))
+          (unless (and story-id (> roots 0) header)
+            (error "Hacker News smoke test returned no stories"))
+          (sqlite-close nnhackernews--database)
+          (setq nnhackernews--database nil)
+          (cl-letf (((symbol-function 'nnhackernews--publish-active) #'ignore)
+                    ((symbol-function 'nnhackernews--schedule-reselect) #'ignore))
+            (nnhackernews--start-comment-sync "" story-id 'latest 1 t)
+            (url-queue-run-queue)
+            (while (> (hash-table-count nnhackernews--comment-syncs) 0)
+              (accept-process-output nil 0.05)
+              (url-queue-run-queue)))
+          (setq nnhackernews--database (sqlite-open file)
+                comments
+                (caar
+                 (sqlite-select
+                  nnhackernews--database
+                  "SELECT COUNT(*) FROM items WHERE type = 'comment'")))
+          (unless (<= comments nnhackernews-comment-page-size)
+            (error "Hacker News smoke test fetched more than one page"))
+          (princ
+           (format "Hacker News smoke: %d roots, story %d, %d comments\n"
+                   roots story-id comments)))
       (when (sqlitep nnhackernews--database)
-        (sqlite-close nnhackernews--database)))))
+        (sqlite-close nnhackernews--database))
+      (delete-directory directory t))))
 
 (provide 'nnextension-smoke)
 

@@ -72,10 +72,22 @@
   :type '(integer 1)
   :group 'nnhackernews)
 
+(defcustom nnhackernews-comment-page-size 50
+  "Number of comments fetched by each on-demand page request."
+  :type '(integer 1)
+  :group 'nnhackernews)
+
+(defcustom nnhackernews-thread-refresh-days 7
+  "Days after opening a story during which normal scans refresh comments."
+  :type 'natnum
+  :group 'nnhackernews)
+
 (dolist (variable '(nnhackernews-directory
                     nnhackernews-feed-limit
                     nnhackernews-request-timeout
-                    nnhackernews-reply-subject-length))
+                    nnhackernews-reply-subject-length
+                    nnhackernews-comment-page-size
+                    nnhackernews-thread-refresh-days))
   (nnoo-define variable nil))
 
 (defvoo nnhackernews--database nil)
@@ -84,7 +96,11 @@
 
 (cl-defstruct nnhackernews--background-sync server database feeds)
 
+(cl-defstruct nnhackernews--comment-sync
+  key server database story-id group mode remaining page new-count touch)
+
 (defvar nnhackernews--background-syncs (make-hash-table :test #'equal))
+(defvar nnhackernews--comment-syncs (make-hash-table :test #'equal))
 
 (defconst nnhackernews--firebase-base-url
   "https://hacker-news.firebaseio.com/v0")
@@ -115,7 +131,8 @@
 
 (defvar-keymap nnhackernews-mode-map
   :doc "Bindings active in nnhackernews Gnus buffers."
-  "C-c C-r" #'nnhackernews-refresh-thread)
+  "C-c C-r" #'nnhackernews-refresh-thread
+  "C-c C-o" #'nnhackernews-fetch-older)
 
 (define-minor-mode nnhackernews-mode
   "Minor mode enabled in Gnus buffers backed by nnhackernews."
@@ -198,7 +215,10 @@
 (defun nnhackernews--item-type (item)
   "Return a normalized type string for remote ITEM."
   (or (plist-get item :type)
-      (if (nnhackernews--tagged-p item "job") "job" "story")))
+      (cond
+       ((nnhackernews--tagged-p item "comment") "comment")
+       ((nnhackernews--tagged-p item "job") "job")
+       (t "story"))))
 
 (defun nnhackernews--classify-story (item fallback)
   "Classify root ITEM into a group, using FALLBACK when necessary."
@@ -571,40 +591,195 @@ Finish immediately when ERRORS is non-nil."
            (nnhackernews--background-feeds sync results errors)))
         sync)))
 
-(defun nnhackernews--flatten-thread (root)
-  "Return ROOT and its recursive Algolia children as a flat list."
-  (cons root
-        (cl-mapcan #'nnhackernews--flatten-thread
-                   (plist-get root :children))))
+(defun nnhackernews--thread-metadata-key (story-id field)
+  "Return the metadata key for STORY-ID and FIELD."
+  (format "thread.%d.%s" story-id field))
 
-(defun nnhackernews--visible-count (story-id)
-  "Return the number of visible cached items in STORY-ID."
-  (caar
-   (sqlite-select
-    nnhackernews--database
-    "SELECT COUNT(*) FROM items
-      WHERE story_id = ? AND deleted = 0 AND dead = 0"
-    (vector story-id))))
+(defun nnhackernews--thread-metadata-get (database story-id field)
+  "Return FIELD metadata for STORY-ID in DATABASE."
+  (nnextension-core-metadata-get
+   database (nnhackernews--thread-metadata-key story-id field)))
 
-(defun nnhackernews--sync-thread (story-id)
-  "Synchronize STORY-ID from Algolia and return newly visible item count."
-  (let* ((cached-root (nnhackernews--item-by-id story-id))
-         (group (plist-get cached-root :group-name))
-         (remote
-          (nnhackernews--algolia-request (format "/items/%d" story-id)))
-         (remote-id (nnhackernews--remote-id remote))
-         (before (nnhackernews--visible-count story-id))
-         (now (time-convert nil 'integer)))
-    (let ((items
-           (seq-sort-by
-            #'nnhackernews--remote-id #'<
-            (nnhackernews--flatten-thread remote))))
-      (with-sqlite-transaction nnhackernews--database
-        (dolist (item items)
-          (nnhackernews--upsert-item
-           item group story-id
-           (and (= (nnhackernews--remote-id item) remote-id) now)))))
-    (max 0 (- (nnhackernews--visible-count story-id) before))))
+(defun nnhackernews--thread-metadata-set (database story-id field value)
+  "Store FIELD metadata VALUE for STORY-ID in DATABASE."
+  (nnextension-core-metadata-set
+   database (nnhackernews--thread-metadata-key story-id field) value))
+
+(defun nnhackernews--comment-cursor (database story-id direction)
+  "Return the comment cursor in DATABASE for STORY-ID and DIRECTION."
+  (or (when-let* ((value
+                   (nnhackernews--thread-metadata-get
+                    database story-id direction)))
+        (string-to-number value))
+      (caar
+       (sqlite-select
+        database
+        (format "SELECT %s(created_at) FROM items
+                  WHERE story_id = ? AND type = 'comment'"
+                (if (equal direction "newest") "MAX" "MIN"))
+        (vector story-id)))))
+
+(defun nnhackernews--comment-url (sync)
+  "Return the next Algolia comment URL for SYNC."
+  (let* ((mode (nnhackernews--comment-sync-mode sync))
+         (database (nnhackernews--comment-sync-database sync))
+         (story-id (nnhackernews--comment-sync-story-id sync))
+         (cursor
+          (pcase mode
+            ('new (nnhackernews--comment-cursor database story-id "newest"))
+            ('older (nnhackernews--comment-cursor database story-id "oldest"))))
+         (filters
+          (pcase mode
+            ('new (and cursor (format "created_at_i>=%d" cursor)))
+            ('older (and cursor (format "created_at_i<%d" cursor)))))
+         (query
+          `(("tags" ,(format "comment,story_%d" story-id))
+            ("hitsPerPage" ,(number-to-string nnhackernews-comment-page-size))
+            ("page" ,(number-to-string
+                       (nnhackernews--comment-sync-page sync))))))
+    (nnhackernews--algolia-url
+     "/search_by_date"
+     (append query (and filters `(("numericFilters" ,filters)))))))
+
+(defun nnhackernews--store-comment-hits (sync hits)
+  "Store comment HITS for SYNC and return the new-item count."
+  (let* ((database (nnhackernews--comment-sync-database sync))
+         (story-id (nnhackernews--comment-sync-story-id sync))
+         (group (nnhackernews--comment-sync-group sync))
+         (nnhackernews--database database)
+         (new 0))
+    (with-sqlite-transaction database
+      (dolist (hit (seq-sort-by #'nnhackernews--remote-id #'< hits))
+        (unless (nnhackernews--item-by-id (nnhackernews--remote-id hit))
+          (cl-incf new))
+        (nnhackernews--upsert-item hit group story-id))
+      (sqlite-execute
+       database "UPDATE items SET thread_fetched_at = ? WHERE id = ?"
+       (vector (time-convert nil 'integer) story-id)))
+    (when (nnhackernews--comment-sync-touch sync)
+      (nnhackernews--thread-metadata-set
+       database story-id "watched_at" (time-convert nil 'integer)))
+    (pcase-let
+        ((`(,oldest ,newest)
+          (car
+           (sqlite-select
+            database
+            "SELECT MIN(created_at), MAX(created_at) FROM items
+              WHERE story_id = ? AND type = 'comment'"
+            (vector story-id)))))
+      (when oldest
+        (nnhackernews--thread-metadata-set database story-id "oldest" oldest)
+        (nnhackernews--thread-metadata-set database story-id "newest" newest)))
+    new))
+
+(defun nnhackernews--finish-comment-sync (sync &optional error)
+  "Finish comment SYNC, optionally reporting ERROR."
+  (let ((database (nnhackernews--comment-sync-database sync))
+        (server (nnhackernews--comment-sync-server sync))
+        (group (nnhackernews--comment-sync-group sync))
+        (new (nnhackernews--comment-sync-new-count sync)))
+    (unwind-protect
+        (if error
+            (nnheader-message
+             3 "nnhackernews comment sync failed: %s"
+             (error-message-string error))
+          (nnhackernews--publish-active database server t)
+          (when (> new 0)
+            (nnhackernews--schedule-reselect group server))
+          (nnheader-message 5 "Loaded %d new Hacker News comments" new))
+      (sqlite-close database)
+      (remhash (nnhackernews--comment-sync-key sync)
+               nnhackernews--comment-syncs))))
+
+(defun nnhackernews--comment-page-result (sync data error)
+  "Process one comment page DATA or ERROR for SYNC."
+  (if error
+      (nnhackernews--finish-comment-sync sync error)
+    (let* ((hits (plist-get data :hits))
+           (page (plist-get data :page))
+           (pages (plist-get data :nbPages))
+           (mode (nnhackernews--comment-sync-mode sync)))
+      (cl-incf (nnhackernews--comment-sync-new-count sync)
+               (nnhackernews--store-comment-hits sync hits))
+      (pcase mode
+        ('new
+         (if (< (1+ page) pages)
+             (progn
+               (setf (nnhackernews--comment-sync-page sync) (1+ page))
+               (nnhackernews--request-comment-page sync))
+           (nnhackernews--finish-comment-sync sync)))
+        ('older
+         (cl-decf (nnhackernews--comment-sync-remaining sync))
+         (when (< (length hits) nnhackernews-comment-page-size)
+           (nnhackernews--thread-metadata-set
+            (nnhackernews--comment-sync-database sync)
+            (nnhackernews--comment-sync-story-id sync) "older_exhausted" 1))
+         (if (and (> (nnhackernews--comment-sync-remaining sync) 0) hits)
+             (nnhackernews--request-comment-page sync)
+           (nnhackernews--finish-comment-sync sync)))
+        (_
+         (when (<= pages 1)
+           (nnhackernews--thread-metadata-set
+            (nnhackernews--comment-sync-database sync)
+            (nnhackernews--comment-sync-story-id sync) "older_exhausted" 1))
+         (nnhackernews--finish-comment-sync sync))))))
+
+(defun nnhackernews--request-comment-page (sync)
+  "Request the next comment page for SYNC."
+  (nnextension-core-json-request-async
+   "GET" (nnhackernews--comment-url sync)
+   (lambda (data error)
+     (nnhackernews--comment-page-result sync data error))
+   :headers '(("User-Agent" . "nnextension-nnhackernews/0.1"))
+   :timeout nnhackernews-request-timeout
+   :service "Hacker News"))
+
+(defun nnhackernews--start-comment-sync
+    (server story-id mode &optional pages touch)
+  "Start MODE comment sync for STORY-ID on SERVER.
+PAGES controls older-page loading.  TOUCH renews local watch state."
+  (let ((key (cons server story-id)))
+    (or (gethash key nnhackernews--comment-syncs)
+        (let* ((database
+                (sqlite-open
+                 (nnextension-core-database-file nnhackernews-directory server)))
+               (nnhackernews--database database)
+               (_initialized (nnhackernews--initialize-database database))
+               (root (nnhackernews--item-by-id story-id))
+               (sync
+                (make-nnhackernews--comment-sync
+                 :key key :server server :database database
+                 :story-id story-id :group (plist-get root :group-name)
+                 :mode mode :remaining (or pages 1) :page 0
+                 :new-count 0 :touch touch)))
+          (puthash key sync nnhackernews--comment-syncs)
+          (when touch
+            (nnhackernews--thread-metadata-set
+             database story-id "watched_at" (time-convert nil 'integer)))
+          (if (and (eq mode 'older)
+                   (nnhackernews--thread-metadata-get
+                    database story-id "older_exhausted"))
+              (nnhackernews--finish-comment-sync sync)
+            (nnhackernews--request-comment-page sync))
+          sync))))
+
+(defun nnhackernews--refresh-watched-threads (server)
+  "Refresh recently watched threads for SERVER."
+  (when (> nnhackernews-thread-refresh-days 0)
+    (let ((cutoff (- (time-convert nil 'integer)
+                     (* nnhackernews-thread-refresh-days 86400))))
+      (dolist
+          (row
+           (sqlite-select
+            nnhackernews--database
+            "SELECT key FROM metadata
+              WHERE key GLOB 'thread.*.watched_at'
+                AND CAST(value AS INTEGER) >= ?"
+            (vector cutoff)))
+        (when (string-match "\\`thread\\.\\([0-9]+\\)\\.watched_at\\'"
+                            (car row))
+          (nnhackernews--start-comment-sync
+           server (string-to-number (match-string 1 (car row))) 'new))))))
 
 (defun nnhackernews--message-id (id)
   "Return a stable message ID for Hacker News ID."
@@ -622,15 +797,15 @@ Finish immediately when ERRORS is non-nil."
        (= (plist-get item :dead) 0)))
 
 (defun nnhackernews--references (item)
-  "Return visible ancestor message IDs for ITEM."
-  (let ((parent-id (plist-get item :parent-id))
-        ancestors)
-    (while parent-id
-      (let ((parent (nnhackernews--item-by-id parent-id)))
-        (when (nnhackernews--visible-p parent)
-          (push (nnhackernews--message-id parent-id) ancestors))
-        (setq parent-id (plist-get parent :parent-id))))
-    (string-join ancestors " ")))
+  "Return root and direct-parent message IDs for ITEM."
+  (let ((parent (plist-get item :parent-id))
+        (story (plist-get item :story-id)))
+    (cond
+     ((null parent) "")
+     ((= parent story) (nnhackernews--message-id story))
+     (t (format "%s %s"
+                (nnhackernews--message-id story)
+                (nnhackernews--message-id parent))))))
 
 (defun nnhackernews--permalink (item)
   "Return the Hacker News permalink for ITEM."
@@ -820,6 +995,7 @@ Finish immediately when ERRORS is non-nil."
   (nnhackernews--with-report
     (setq server (nnhackernews--possibly-open server))
     (nnhackernews--start-background-sync server)
+    (nnhackernews--refresh-watched-threads server)
     (nnheader-report 'nnhackernews "Hacker News sync running in background")
     t))
 
@@ -882,16 +1058,11 @@ Finish immediately when ERRORS is non-nil."
            (root-p (and item (equal (plist-get item :type) "story"))))
       (unless item
         (error "No such Hacker News article: %s" article))
-      (when (and root-p (null (plist-get item :thread-fetched-at)))
-        (condition-case err
-            (let ((new (nnhackernews--sync-thread (plist-get item :story-id))))
-              (setq item (nnhackernews--item-by-id (plist-get item :id)))
-              (when (> new 0)
-                (nnhackernews--schedule-reselect group server)))
-          (nnextension-core-http-error
-           (nnheader-message
-            3 "nnhackernews: could not load comments: %s"
-            (error-message-string err)))))
+      (when root-p
+        (nnhackernews--start-comment-sync
+         server (plist-get item :story-id)
+         (if (plist-get item :thread-fetched-at) 'new 'latest)
+         1 t))
       (let* ((header (nnhackernews--make-header item))
              (permalink (nnhackernews--permalink item)))
         (unless header
@@ -933,19 +1104,31 @@ Finish immediately when ERRORS is non-nil."
 
 ;;;###autoload
 (defun nnhackernews-refresh-thread ()
-  "Refresh the Hacker News thread containing the article at point."
+  "Start refreshing new comments for the thread at point."
   (interactive)
-  (pcase-let* ((`(,server ,group ,article ,summary)
+  (pcase-let* ((`(,server ,group ,article ,_summary)
                 (nnhackernews--current-location)))
     (nnhackernews--possibly-open server)
     (let* ((item (or (nnhackernews--item-by-article group article)
                      (user-error "No cached Hacker News item at point")))
-           (story-id (plist-get item :story-id))
-           (new (nnhackernews--sync-thread story-id)))
-      (message "Refreshed Hacker News thread; %d new articles" new)
-      (when (buffer-live-p summary)
-        (with-current-buffer summary
-          (gnus-summary-reselect-current-group t nil))))))
+           (story-id (plist-get item :story-id)))
+      (nnhackernews--start-comment-sync server story-id 'new 1 t)
+      (message "Refreshing Hacker News comments in background"))))
+
+;;;###autoload
+(defun nnhackernews-fetch-older (&optional pages)
+  "Fetch PAGES of older comments for the thread at point."
+  (interactive "P")
+  (pcase-let* ((`(,server ,group ,article ,_summary)
+                (nnhackernews--current-location))
+               (item (or (nnhackernews--item-by-article group article)
+                         (user-error "No cached Hacker News item at point")))
+               (pages (max 1 (prefix-numeric-value (or pages 1)))))
+    (nnhackernews--possibly-open server)
+    (nnhackernews--start-comment-sync
+     server (plist-get item :story-id) 'older pages t)
+    (message "Loading %d older Hacker News comment page%s in background"
+             pages (if (= pages 1) "" "s"))))
 
 (defun nnhackernews--current-group-p ()
   "Return non-nil when the current Gnus buffer uses nnhackernews."

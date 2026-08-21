@@ -48,11 +48,23 @@ the background with bounded parallel requests. The refresh retains the latest
 when complete. Customize `nnhackernews-feed-limit` to change that window.
 Article-number mappings never change with scores, comments, or feed positions.
 
-Opening a story for the first time downloads its complete comment tree and
-reselects the current Gnus summary so the comments appear as threaded
-articles. Normal Gnus refreshes enqueue a background root refresh but do not
-poll previously opened comment trees. Use `C-c C-r` in a nnhackernews summary
-or article buffer to refresh the current thread manually.
+Opening a story starts an asynchronous request for its latest 50 comments.
+New comments become unread Gnus articles under the cached story. The backend
+keeps separate newest and oldest timestamp cursors, so refreshes never require
+downloading the complete discussion. Customize
+`nnhackernews-comment-page-size` to change the page size.
+
+| Command | Action |
+| --- | --- |
+| `M-g` | Refresh roots and new comments in recently watched threads |
+| `C-c C-r` | Force an incremental refresh of the current thread |
+| `C-c C-o` | Fetch one older comment page for the current thread |
+| `C-u N C-c C-o` | Fetch N older comment pages |
+| `/ o` | Show old or read comments already cached by Gnus |
+
+Opening a story watches it locally for seven days by default. Normal Gnus
+scans refresh watched threads in the background; customize
+`nnhackernews-thread-refresh-days` or set it to zero to disable this behavior.
 
 Root articles show the Hacker News self text, score, comment count, permalink,
 and original article link. External pages are not downloaded into Emacs.
@@ -62,8 +74,8 @@ editing, deletion, or expiry.
 The backend uses the official
 [Hacker News Firebase API](https://github.com/HackerNews/API) for feed
 membership, the [Algolia HN API](https://hn.algolia.com/api) for batched story
-metadata and recursive comment trees, and the official item endpoint when a
-new root has not reached Algolia yet. Its implementation is new, with the
+metadata and paginated comments, and the official item endpoint when a new
+root has not reached Algolia yet. Its implementation is new, with the
 original [dickmao/nnhackernews](https://github.com/dickmao/nnhackernews)
 serving as a behavioral reference.
 

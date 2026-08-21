@@ -216,6 +216,7 @@ by `nnextension-core-json-request-async'."
 (defun nnextension-core-initialize-metadata (database)
   "Initialize common metadata storage in DATABASE."
   (sqlite-execute database "PRAGMA journal_mode = WAL")
+  (sqlite-execute database "PRAGMA busy_timeout = 5000")
   (sqlite-execute
    database
    "CREATE TABLE IF NOT EXISTS metadata (

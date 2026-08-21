@@ -118,31 +118,54 @@
            (= (plist-get (nnhackernews--item-by-id 1) :article-no)
               first-number)))))))
 
-(ert-deftest nnhackernews-test-thread-sync-and-visible-references ()
+(ert-deftest nnhackernews-test-paged-comments-use-sparse-references ()
   (nnhackernews-test--with-database
     (nnhackernews--upsert-item
      (nnhackernews-test--story 100 :comments 2) "news" 100)
-    (let* ((deleted
-            (nnhackernews-test--comment
-             101 100 100 :author nil :text nil
-             :children
-             (list (nnhackernews-test--comment
-                    102 100 101 :text "Nested response"))))
-           (remote
-            (nnhackernews-test--story
-             100 :comments 2 :children (list deleted))))
-      (cl-letf (((symbol-function 'nnhackernews--algolia-request)
-                 (lambda (&rest _) remote)))
-        (should (= (nnhackernews--sync-thread 100) 1)))
-      (let ((root (nnhackernews--item-by-id 100))
-            (hidden (nnhackernews--item-by-id 101))
-            (nested (nnhackernews--item-by-id 102)))
-        (should (integerp (plist-get root :thread-fetched-at)))
-        (should-not (nnhackernews--visible-p hidden))
-        (should
-         (equal (nnhackernews--references nested)
-                "<100@ycombinator.com>"))
-        (should (equal (nnhackernews--subject nested) "Nested response"))))))
+    (nnhackernews--upsert-item
+     (nnhackernews-test--comment 101 100 100 :author nil :text nil)
+     "news" 100)
+    (nnhackernews--upsert-item
+     (nnhackernews-test--comment 102 100 101 :text "Nested response")
+     "news" 100)
+    (let ((root (nnhackernews--item-by-id 100))
+          (hidden (nnhackernews--item-by-id 101))
+          (nested (nnhackernews--item-by-id 102)))
+      (should root)
+      (should-not (nnhackernews--visible-p hidden))
+      (should
+       (equal (nnhackernews--references nested)
+              "<100@ycombinator.com> <101@ycombinator.com>"))
+      (should (equal (nnhackernews--subject nested) "Nested response")))))
+
+(ert-deftest nnhackernews-test-comment-cursors-drive-dynamic-queries ()
+  (nnhackernews-test--with-database
+    (nnhackernews--upsert-item
+     (nnhackernews-test--story 100 :comments 2) "news" 100)
+    (let ((sync
+           (make-nnhackernews--comment-sync
+            :server "" :database nnhackernews--database
+            :story-id 100 :group "news" :mode 'latest
+            :remaining 1 :page 0 :new-count 0 :touch t)))
+      (should
+       (= (nnhackernews--store-comment-hits
+           sync
+           (list
+            (nnhackernews-test--comment 101 100 100 :time 1000)
+            (nnhackernews-test--comment 102 100 100 :time 2000)))
+          2))
+      (should (= (nnhackernews--comment-cursor
+                  nnhackernews--database 100 "oldest") 1000))
+      (should (= (nnhackernews--comment-cursor
+                  nnhackernews--database 100 "newest") 2000))
+      (setf (nnhackernews--comment-sync-mode sync) 'older)
+      (should
+       (string-match-p "created_at_i%3C1000"
+                       (nnhackernews--comment-url sync)))
+      (setf (nnhackernews--comment-sync-mode sync) 'new)
+      (should
+       (string-match-p "created_at_i%3E%3D2000"
+                       (nnhackernews--comment-url sync))))))
 
 (ert-deftest nnhackernews-test-message-headers-and-summary-html ()
   (nnhackernews-test--with-database
@@ -164,40 +187,25 @@
       (should (string-match-p "Open original article" html))
       (should (string-match-p "View on Hacker News" html)))))
 
-(ert-deftest nnhackernews-test-first-open-fetches-thread-once ()
+(ert-deftest nnhackernews-test-first-open-starts-paged-comment-load ()
   (nnhackernews-test--with-database
     (let* ((root
             (nnhackernews--upsert-item
              (nnhackernews-test--story 100) "news" 100))
            (article (plist-get root :article-no))
            (output (get-buffer-create " *nnhackernews article test*"))
-           (sync-count 0)
-           (reselect-count 0))
+           call)
       (unwind-protect
           (cl-letf
-              (((symbol-function 'nnhackernews--possibly-open) #'ignore)
-               ((symbol-function 'nnhackernews--sync-thread)
-                (lambda (story-id)
-                  (cl-incf sync-count)
-                  (sqlite-execute
-                   nnhackernews--database
-                   "UPDATE items SET thread_fetched_at = 1 WHERE id = ?"
-                   (vector story-id))
-                  1))
-               ((symbol-function 'nnhackernews--schedule-reselect)
-                (lambda (_group _server) (cl-incf reselect-count))))
+              (((symbol-function 'nnhackernews--possibly-open) #'identity)
+               ((symbol-function 'nnhackernews--start-comment-sync)
+                (lambda (&rest arguments) (setq call arguments))))
             (should
              (equal
               (nnhackernews-request-article
                article "news" "" output)
               '("news" . 1)))
-            (should
-             (equal
-              (nnhackernews-request-article
-               article "news" "" output)
-              '("news" . 1)))
-            (should (= sync-count 1))
-            (should (= reselect-count 1))
+            (should (equal call '("" 100 latest 1 t)))
             (with-current-buffer output
               (goto-char (point-min))
               (should (search-forward
@@ -225,31 +233,6 @@
               (nnhackernews--schedule-reselect "show" "")))
           (should (= reselects 1)))
       (kill-buffer summary))))
-
-(ert-deftest nnhackernews-test-first-open-falls-back-to-cached-root ()
-  (nnhackernews-test--with-database
-    (let* ((root
-            (nnhackernews--upsert-item
-             (nnhackernews-test--story 100) "news" 100))
-           (output (get-buffer-create " *nnhackernews cached article test*")))
-      (unwind-protect
-          (cl-letf
-              (((symbol-function 'nnhackernews--possibly-open) #'ignore)
-               ((symbol-function 'nnhackernews--sync-thread)
-                (lambda (&rest _)
-                  (signal 'nnextension-core-http-error
-                          '(503 "unavailable")))))
-            (should
-             (equal
-              (nnhackernews-request-article
-               (plist-get root :article-no) "news" "" output)
-              '("news" . 1)))
-            (should-not
-             (plist-get (nnhackernews--item-by-id 100) :thread-fetched-at))
-            (with-current-buffer output
-              (goto-char (point-min))
-              (should (search-forward "A useful story" nil t))))
-        (kill-buffer output)))))
 
 (ert-deftest nnhackernews-test-gnus-read-protocol ()
   (nnhackernews-test--with-database
@@ -287,41 +270,48 @@
               (should (search-forward "A useful story" nil t))))
         (kill-buffer nntp-server-buffer)))))
 
-(ert-deftest nnhackernews-test-manual-refresh-reselects-summary ()
+(ert-deftest nnhackernews-test-manual-refresh-starts-new-comment-load ()
   (nnhackernews-test--with-database
     (let* ((root
             (nnhackernews--upsert-item
              (nnhackernews-test--story 100) "news" 100))
-           (summary (generate-new-buffer " *nnhackernews summary test*"))
-           (refreshes 0)
-           (reselects 0))
-      (unwind-protect
-          (cl-letf
-              (((symbol-function 'nnhackernews--current-location)
-                (lambda ()
-                  (list "" "news" (plist-get root :article-no) summary)))
-               ((symbol-function 'nnhackernews--possibly-open) #'ignore)
-               ((symbol-function 'nnhackernews--sync-thread)
-                (lambda (_story-id) (cl-incf refreshes) 2))
-               ((symbol-function 'gnus-summary-reselect-current-group)
-                (lambda (&rest _) (cl-incf reselects))))
-            (nnhackernews-refresh-thread)
-            (should (= refreshes 1))
-            (should (= reselects 1)))
-        (kill-buffer summary)))))
+           call)
+      (cl-letf
+          (((symbol-function 'nnhackernews--current-location)
+            (lambda () (list "" "news" (plist-get root :article-no) nil)))
+           ((symbol-function 'nnhackernews--possibly-open) #'identity)
+           ((symbol-function 'nnhackernews--start-comment-sync)
+            (lambda (&rest arguments) (setq call arguments))))
+        (nnhackernews-refresh-thread)
+        (should (equal call '("" 100 new 1 t)))))))
+
+(ert-deftest nnhackernews-test-fetch-older-honors-prefix ()
+  (nnhackernews-test--with-database
+    (let* ((root
+            (nnhackernews--upsert-item
+             (nnhackernews-test--story 100) "news" 100))
+           call)
+      (cl-letf
+          (((symbol-function 'nnhackernews--current-location)
+            (lambda () (list "" "news" (plist-get root :article-no) nil)))
+           ((symbol-function 'nnhackernews--possibly-open) #'identity)
+           ((symbol-function 'nnhackernews--start-comment-sync)
+            (lambda (&rest arguments) (setq call arguments))))
+        (nnhackernews-fetch-older 3)
+        (should (equal call '("" 100 older 3 t)))))))
 
 (ert-deftest nnhackernews-test-group-scan-starts-background-sync ()
   (nnhackernews-test--with-database
     (let ((background-scans 0)
-          (thread-scans 0))
+          (watched-scans 0))
       (cl-letf (((symbol-function 'nnhackernews--possibly-open) #'identity)
                 ((symbol-function 'nnhackernews--start-background-sync)
                  (lambda (_server) (cl-incf background-scans)))
-                ((symbol-function 'nnhackernews--sync-thread)
-                 (lambda (&rest _) (cl-incf thread-scans))))
+                ((symbol-function 'nnhackernews--refresh-watched-threads)
+                 (lambda (_server) (cl-incf watched-scans))))
         (should (nnhackernews-request-scan nil ""))
         (should (= background-scans 1))
-        (should (= thread-scans 0))))))
+        (should (= watched-scans 1))))))
 
 (ert-deftest nnhackernews-test-early-finish-does-not-wait ()
   (let ((task 'background-task)
@@ -350,7 +340,8 @@
         (lambda (report)
           (string-match-p "not implemented" (cadr report)))
         reports))))
-  (should-not (fboundp 'nnhackernews-request-expire-articles)))
+  (should-not (fboundp 'nnhackernews-request-expire-articles))
+  (should-not (fboundp 'nnhackernews--sync-thread)))
 
 (provide 'nnhackernews-test)
 
