@@ -41,10 +41,6 @@
   "Read Hacker News through Gnus."
   :group 'gnus)
 
-(define-error 'nnhackernews-error "nnhackernews error")
-(define-error 'nnhackernews-http-error "Hacker News HTTP error"
-  'nnhackernews-error)
-
 (defmacro nnhackernews--with-report (&rest body)
   "Run BODY, reporting errors through the Gnus backend."
   (declare (indent 0) (debug t))
@@ -119,10 +115,6 @@
   :lighter " HN"
   :keymap nnhackernews-mode-map)
 
-(defun nnhackernews--database-file (server)
-  "Return the database file used for virtual SERVER."
-  (nnextension-core-database-file nnhackernews-directory server))
-
 (defun nnhackernews--initialize-database (database)
   "Create the nnhackernews schema in DATABASE."
   (nnextension-core-initialize-metadata database)
@@ -190,10 +182,7 @@
   "Return ITEM's numeric Hacker News identifier."
   (let ((id (or (plist-get item :id)
                 (plist-get item :objectID))))
-    (cond
-     ((integerp id) id)
-     ((stringp id) (string-to-number id))
-     (t nil))))
+    (if (stringp id) (string-to-number id) id)))
 
 (defun nnhackernews--tagged-p (item tag)
   "Return non-nil when Algolia ITEM has TAG."
@@ -202,14 +191,11 @@
 (defun nnhackernews--item-type (item)
   "Return a normalized type string for remote ITEM."
   (or (plist-get item :type)
-      (cond
-       ((nnhackernews--tagged-p item "job") "job")
-       ((nnhackernews--tagged-p item "story") "story")
-       (t "story"))))
+      (if (nnhackernews--tagged-p item "job") "job" "story")))
 
 (defun nnhackernews--classify-story (item fallback)
   "Classify root ITEM into a group, using FALLBACK when necessary."
-  (let ((title (or (plist-get item :title) "")))
+  (let ((title (plist-get item :title)))
     (cond
      ((or (equal (nnhackernews--item-type item) "job")
           (nnhackernews--tagged-p item "job"))
@@ -235,11 +221,10 @@
          (deleted
           (or (eq (plist-get item :deleted) t)
               (and (equal type "comment")
-                   (null author) (string-empty-p (or text "")))))
+                   (null author) (null text))))
          (created-at
           (or (plist-get item :created_at_i)
-              (plist-get item :time)
-              0)))
+              (plist-get item :time))))
     (list
      :id id
      :group-name (if root-p
@@ -275,8 +260,6 @@ THREAD-FETCHED-AT records completion of a root thread download."
          (article-no (or (plist-get existing :article-no)
                          (nnhackernews--next-article-number group)))
          (now (time-convert nil 'integer)))
-    (unless (and id (member group (mapcar #'car nnhackernews--groups)))
-      (signal 'nnhackernews-error '("Remote item lacks an ID or valid group")))
     (sqlite-execute
      nnhackernews--database
      "INSERT INTO items
@@ -285,15 +268,13 @@ THREAD-FETCHED-AT records completion of a root thread download."
          fetched_at, thread_fetched_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
-        parent_id = COALESCE(excluded.parent_id, items.parent_id),
-        author = COALESCE(excluded.author, items.author),
-        created_at = CASE WHEN excluded.created_at = 0
-                          THEN items.created_at
-                          ELSE excluded.created_at END,
-        title = COALESCE(excluded.title, items.title),
-        text = COALESCE(excluded.text, items.text),
-        url = COALESCE(excluded.url, items.url),
-        score = COALESCE(excluded.score, items.score),
+        parent_id = excluded.parent_id,
+        author = excluded.author,
+        created_at = excluded.created_at,
+        title = excluded.title,
+        text = excluded.text,
+        url = excluded.url,
+        score = excluded.score,
         descendants = COALESCE(excluded.descendants, items.descendants),
         deleted = excluded.deleted,
         dead = excluded.dead,
@@ -310,21 +291,13 @@ THREAD-FETCHED-AT records completion of a root thread download."
       (plist-get normalized :dead) now thread-fetched-at))
     (nnhackernews--item-by-id id)))
 
-(defun nnhackernews--json-error-message (data fallback)
-  "Extract an error message from JSON DATA, or return FALLBACK."
-  (or (plist-get data :message)
-      (plist-get data :error)
-      fallback))
-
 (defun nnhackernews--request (url)
   "Return parsed JSON retrieved from URL."
   (nnextension-core-json-request
    "GET" url
    :headers '(("User-Agent" . "nnextension-nnhackernews/0.1"))
    :timeout nnhackernews-request-timeout
-   :error-type 'nnhackernews-http-error
-   :service "Hacker News"
-   :error-message-function #'nnhackernews--json-error-message))
+   :service "Hacker News"))
 
 (defun nnhackernews--firebase-request (path)
   "Return parsed Firebase JSON at PATH."
@@ -337,47 +310,33 @@ THREAD-FETCHED-AT records completion of a root thread download."
    (concat nnhackernews--algolia-base-url path
            (and query (concat "?" (url-build-query-string query))))))
 
-(defun nnhackernews--chunks (items size)
-  "Split ITEMS into lists of at most SIZE elements."
-  (let (chunks)
-    (while items
-      (push (seq-take items size) chunks)
-      (setq items (nthcdr size items)))
-    (nreverse chunks)))
-
-(defun nnhackernews--algolia-story-hits (ids)
-  "Return Algolia story search hits matching IDS."
-  (cl-mapcan
-   (lambda (chunk)
-     (let ((tags
-            (format
-             "story,(%s)"
-             (mapconcat
-              (lambda (id) (format "story_%d" id)) chunk ","))))
+(defun nnhackernews--algolia-root-hits (group ids)
+  "Return Algolia root hits for GROUP matching official feed IDS."
+  (if (equal group "job")
+      (plist-get
+       (nnhackernews--algolia-request
+        "/search_by_date"
+        `(("tags" "job")
+          ("hitsPerPage" ,(number-to-string (length ids)))))
+       :hits)
+    (cl-mapcan
+     (lambda (chunk)
        (plist-get
         (nnhackernews--algolia-request
          "/search_by_date"
-         `(("tags" ,tags)
+         `(("tags"
+            ,(format
+              "story,(%s)"
+              (mapconcat
+               (lambda (id) (format "story_%d" id)) chunk ",")))
            ("hitsPerPage" ,(number-to-string (length chunk)))))
-        :hits)))
-   (nnhackernews--chunks ids nnhackernews--algolia-batch-size)))
-
-(defun nnhackernews--algolia-job-hits ()
-  "Return the recent Algolia job hits needed for the configured window."
-  (plist-get
-   (nnhackernews--algolia-request
-    "/search_by_date"
-    `(("tags" "job")
-      ("hitsPerPage" ,(number-to-string nnhackernews-feed-limit))))
-   :hits))
+        :hits))
+     (seq-partition ids nnhackernews--algolia-batch-size))))
 
 (defun nnhackernews--fetch-root-items (group ids)
   "Return remote root items for GROUP in official feed IDS order."
-  (let* ((hits (if (equal group "job")
-                   (nnhackernews--algolia-job-hits)
-                 (nnhackernews--algolia-story-hits ids)))
-         (by-id (make-hash-table :test #'eql)))
-    (dolist (hit hits)
+  (let ((by-id (make-hash-table :test #'eql)))
+    (dolist (hit (nnhackernews--algolia-root-hits group ids))
       (puthash (nnhackernews--remote-id hit) hit by-id))
     (delq
      nil
@@ -387,26 +346,18 @@ THREAD-FETCHED-AT records completion of a root thread download."
             (nnhackernews--firebase-request (format "item/%d" id))))
       ids))))
 
-(defun nnhackernews--id-table (&rest lists)
-  "Return an eql hash table containing every ID in LISTS."
-  (let ((table (make-hash-table :test #'eql)))
-    (dolist (list lists)
-      (dolist (id list)
-        (puthash id t table)))
-    table))
-
 (defun nnhackernews--fetch-news-roots (ids)
   "Return up to `nnhackernews-feed-limit' ordinary roots from IDS."
-  (let (roots)
-    (while (and ids (< (length roots) nnhackernews-feed-limit))
-      (let ((chunk (seq-take ids nnhackernews--algolia-batch-size)))
-        (setq ids (nthcdr nnhackernews--algolia-batch-size ids))
-        (dolist (root (nnhackernews--fetch-root-items "news" chunk))
-          (when (and (< (length roots) nnhackernews-feed-limit)
-                     (equal (nnhackernews--classify-story root "news")
-                            "news"))
-            (push root roots)))))
-    (nreverse roots)))
+  (cl-loop
+   for chunk in (seq-partition ids nnhackernews--algolia-batch-size)
+   nconc (seq-filter
+          (lambda (root)
+            (equal (nnhackernews--classify-story root "news") "news"))
+          (nnhackernews--fetch-root-items "news" chunk))
+   into roots
+   when (>= (length roots) nnhackernews-feed-limit)
+   return (seq-take roots nnhackernews-feed-limit)
+   finally return roots))
 
 (defun nnhackernews--sync-stories ()
   "Synchronize current story roots for all Hacker News groups."
@@ -414,7 +365,7 @@ THREAD-FETCHED-AT records completion of a root thread download."
          (ask-ids (nnhackernews--firebase-request "askstories"))
          (show-ids (nnhackernews--firebase-request "showstories"))
          (job-ids (nnhackernews--firebase-request "jobstories"))
-         (special (nnhackernews--id-table ask-ids show-ids job-ids))
+         (special (append ask-ids show-ids job-ids))
          (feeds
           `(("ask" . ,(seq-take ask-ids nnhackernews-feed-limit))
             ("show" . ,(seq-take show-ids nnhackernews-feed-limit))
@@ -423,30 +374,19 @@ THREAD-FETCHED-AT records completion of a root thread download."
     (dolist
         (root
          (nnhackernews--fetch-news-roots
-          (seq-remove (lambda (id) (gethash id special)) new-ids)))
+          (seq-remove (lambda (id) (memq id special)) new-ids)))
       (push (cons "news" root) roots))
     (dolist (feed feeds)
       (dolist (root (nnhackernews--fetch-root-items (car feed) (cdr feed)))
         (push (cons (car feed) root) roots)))
     (setq roots
           (seq-sort-by
-           (lambda (entry)
-             (let ((item (cdr entry)))
-               (cons (or (plist-get item :created_at_i)
-                         (plist-get item :time) 0)
-                     (or (nnhackernews--remote-id item) 0))))
-           (lambda (left right)
-             (or (< (car left) (car right))
-                 (and (= (car left) (car right))
-                      (< (cdr left) (cdr right)))))
+           (lambda (entry) (nnhackernews--remote-id (cdr entry))) #'<
            roots))
     (with-sqlite-transaction nnhackernews--database
       (dolist (entry roots)
         (nnhackernews--upsert-item
          (cdr entry) (car entry) (nnhackernews--remote-id (cdr entry)))))
-    (nnextension-core-metadata-set
-     nnhackernews--database "last_story_sync"
-     (time-convert nil 'integer))
     (length roots)))
 
 (defun nnhackernews--flatten-thread (root)
@@ -466,32 +406,22 @@ THREAD-FETCHED-AT records completion of a root thread download."
 
 (defun nnhackernews--sync-thread (story-id)
   "Synchronize STORY-ID from Algolia and return newly visible item count."
-  (let* ((cached-root (or (nnhackernews--item-by-id story-id)
-                          (error "No cached Hacker News story %s" story-id)))
+  (let* ((cached-root (nnhackernews--item-by-id story-id))
          (group (plist-get cached-root :group-name))
          (remote
           (nnhackernews--algolia-request (format "/items/%d" story-id)))
          (remote-id (nnhackernews--remote-id remote))
          (before (nnhackernews--visible-count story-id))
          (now (time-convert nil 'integer)))
-    (unless (= (or remote-id -1) story-id)
-      (signal 'nnhackernews-error
-              (list (format "Algolia did not return story %d" story-id))))
     (let ((items
            (seq-sort-by
-            (lambda (item)
-              (cons (or (plist-get item :created_at_i) 0)
-                    (or (nnhackernews--remote-id item) 0)))
-            (lambda (left right)
-              (or (< (car left) (car right))
-                  (and (= (car left) (car right))
-                       (< (cdr left) (cdr right)))))
+            #'nnhackernews--remote-id #'<
             (nnhackernews--flatten-thread remote))))
       (with-sqlite-transaction nnhackernews--database
         (dolist (item items)
           (nnhackernews--upsert-item
            item group story-id
-           (and (= (nnhackernews--remote-id item) story-id) now)))))
+           (and (= (nnhackernews--remote-id item) remote-id) now)))))
     (max 0 (- (nnhackernews--visible-count story-id) before))))
 
 (defun nnhackernews--message-id (id)
@@ -506,8 +436,7 @@ THREAD-FETCHED-AT records completion of a root thread download."
 
 (defun nnhackernews--visible-p (item)
   "Return non-nil when ITEM should appear as a Gnus article."
-  (and item
-       (= (plist-get item :deleted) 0)
+  (and (= (plist-get item :deleted) 0)
        (= (plist-get item :dead) 0)))
 
 (defun nnhackernews--references (item)
@@ -516,45 +445,23 @@ THREAD-FETCHED-AT records completion of a root thread download."
         ancestors)
     (while parent-id
       (let ((parent (nnhackernews--item-by-id parent-id)))
-        (unless parent
-          (setq parent-id nil))
-        (when parent
-          (when (nnhackernews--visible-p parent)
-            (push (nnhackernews--message-id parent-id) ancestors))
-          (setq parent-id (plist-get parent :parent-id)))))
+        (when (nnhackernews--visible-p parent)
+          (push (nnhackernews--message-id parent-id) ancestors))
+        (setq parent-id (plist-get parent :parent-id))))
     (string-join ancestors " ")))
 
 (defun nnhackernews--permalink (item)
   "Return the Hacker News permalink for ITEM."
   (format "%s/item?id=%d" nnhackernews--site-url (plist-get item :id)))
 
-(defun nnhackernews--body-text (item)
-  "Return compact plain text from ITEM's HTML body."
-  (nnextension-core-html-to-text (plist-get item :text)))
-
 (defun nnhackernews--subject (item)
   "Return the story title or a body-derived comment subject for ITEM."
   (if (not (equal (plist-get item :type) "comment"))
-      (nnextension-core-sanitize-header
-       (or (plist-get item :title) "Untitled Hacker News story"))
-    (let ((body
-           (nnextension-core-sanitize-header
-            (nnhackernews--body-text item))))
-      (cond
-       ((string-empty-p body) "Deleted Hacker News comment")
-       ((<= (length body) nnhackernews-reply-subject-length) body)
-       (t
-        (let ((excerpt
-               (string-trim-right
-                (substring body 0 nnhackernews-reply-subject-length))))
-          (when
-              (and
-               (string-match
-                "\\`\\(.+\\)[[:space:]][^[:space:]]*\\'" excerpt)
-               (> (length (match-string 1 excerpt))
-                  (/ nnhackernews-reply-subject-length 2)))
-            (setq excerpt (match-string 1 excerpt)))
-          (concat excerpt "…")))))))
+      (nnextension-core-sanitize-header (plist-get item :title))
+    (truncate-string-to-width
+     (nnextension-core-sanitize-header
+      (nnextension-core-html-to-text (plist-get item :text)))
+     nnhackernews-reply-subject-length nil nil "…")))
 
 (defun nnhackernews--make-header (item)
   "Create a Gnus mail header from cached ITEM."
@@ -584,8 +491,7 @@ THREAD-FETCHED-AT records completion of a root thread download."
 (defun nnhackernews--story-html (item)
   "Return the summary HTML used to display root story ITEM."
   (let* ((title (xml-escape-string (nnhackernews--subject item)))
-         (author
-          (xml-escape-string (or (plist-get item :author) "unknown")))
+         (author (xml-escape-string (plist-get item :author)))
          (permalink (xml-escape-string (nnhackernews--permalink item)))
          (external (plist-get item :url))
          (text (plist-get item :text)))
@@ -603,12 +509,6 @@ THREAD-FETCHED-AT records completion of a root thread download."
                (xml-escape-string external)))
      (format "<a href=\"%s\">View on Hacker News</a></p></article>"
              permalink))))
-
-(defun nnhackernews--article-html (item)
-  "Return display HTML for ITEM."
-  (if (equal (plist-get item :type) "comment")
-      (or (plist-get item :text) "<p>This comment has no available body.</p>")
-    (nnhackernews--story-html item)))
 
 (defun nnhackernews--group-stats (group)
   "Return visible article count, minimum, and maximum for GROUP."
@@ -642,7 +542,9 @@ THREAD-FETCHED-AT records completion of a root thread download."
         (unless (sqlitep nnhackernews--database)
           (make-directory nnhackernews-directory t)
           (setq nnhackernews--database
-                (sqlite-open (nnhackernews--database-file server)))
+                (sqlite-open
+                 (nnextension-core-database-file
+                  nnhackernews-directory server)))
           (nnhackernews--initialize-database nnhackernews--database))
         (nnheader-report 'nnhackernews "Opened Hacker News")
         t)
@@ -721,8 +623,6 @@ THREAD-FETCHED-AT records completion of a root thread download."
   "Select GROUP on SERVER."
   (nnhackernews--with-report
     (nnhackernews--possibly-open server)
-    (unless (assoc group nnhackernews--groups)
-      (error "Invalid nnhackernews group %s" group))
     (setq nnhackernews--current-group group)
     (pcase-let ((`(,count ,minimum ,maximum)
                  (nnhackernews--group-stats group)))
@@ -761,8 +661,7 @@ THREAD-FETCHED-AT records completion of a root thread download."
 
 (defun nnhackernews--schedule-reselect (group)
   "Schedule a summary reselect for GROUP after article display finishes."
-  (when (and (boundp 'gnus-summary-buffer)
-             (buffer-live-p gnus-summary-buffer))
+  (when (buffer-live-p gnus-summary-buffer)
     (let ((summary gnus-summary-buffer))
       (run-at-time
        0 nil
@@ -791,7 +690,7 @@ THREAD-FETCHED-AT records completion of a root thread download."
               (setq item (nnhackernews--item-by-id (plist-get item :id)))
               (when (> new 0)
                 (nnhackernews--schedule-reselect group)))
-          (error
+          (nnextension-core-http-error
            (nnheader-message
             3 "nnhackernews: could not load comments: %s"
             (error-message-string err)))))
@@ -799,33 +698,21 @@ THREAD-FETCHED-AT records completion of a root thread download."
              (permalink (nnhackernews--permalink item)))
         (unless header
           (error "Hacker News article is deleted: %s" article))
-        (with-current-buffer (or buffer nntp-server-buffer)
-          (erase-buffer)
-          (insert "Newsgroups: " group "\n"
-                  "Subject: " (mail-header-subject header) "\n"
-                  "From: " (mail-header-from header) "\n"
-                  "Date: " (mail-header-date header) "\n"
-                  "Message-ID: " (mail-header-id header) "\n")
-          (unless (string-empty-p (mail-header-references header))
-            (insert "References: " (mail-header-references header) "\n"))
-          (insert "Archived-At: " permalink "\n"
-                  "X-Hacker-News-ID: "
-                  (number-to-string (plist-get item :id)) "\n"
-                  "X-Hacker-News-Story-ID: "
-                  (number-to-string (plist-get item :story-id)) "\n"
-                  "X-Hacker-News-Score: "
-                  (number-to-string (or (plist-get item :score) 0)) "\n"
-                  "X-Hacker-News-Comments: "
-                  (number-to-string (or (plist-get item :descendants) 0))
-                  "\nMIME-Version: 1.0\n"
-                  "Content-Type: text/html; charset=utf-8\n"
-                  "Content-Transfer-Encoding: 8bit\n"
-                  "Content-Base: " permalink "\n\n"
-                  "<html><head><base href=\""
-                  nnhackernews--site-url
-                  "/\"></head><body>\n"
-                  (nnhackernews--article-html item)
-                  "\n</body></html>\n"))
+        (nnextension-core-insert-html-article
+         (or buffer nntp-server-buffer) group header permalink
+         nnhackernews--site-url
+         `(("X-Hacker-News-ID"
+            . ,(number-to-string (plist-get item :id)))
+           ("X-Hacker-News-Story-ID"
+            . ,(number-to-string (plist-get item :story-id)))
+           ("X-Hacker-News-Score"
+            . ,(number-to-string (or (plist-get item :score) 0)))
+           ("X-Hacker-News-Comments"
+            . ,(number-to-string (or (plist-get item :descendants) 0))))
+         (if (equal (plist-get item :type) "comment")
+             (or (plist-get item :text)
+                 "<p>This comment has no available body.</p>")
+           (nnhackernews--story-html item)))
         (cons group (plist-get item :article-no))))))
 
 (defun nnhackernews--current-location ()

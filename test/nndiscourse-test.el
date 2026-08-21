@@ -83,21 +83,6 @@
         (should (= (plist-get updated :article-no) 1))
         (should (equal (plist-get updated :topic-title) "Renamed"))))))
 
-(ert-deftest nndiscourse-test-database-adds-like-permission-columns ()
-  (let ((database (sqlite-open)))
-    (unwind-protect
-        (progn
-          (sqlite-execute
-           database "CREATE TABLE posts (remote_id INTEGER PRIMARY KEY)")
-          (nndiscourse--initialize-database database)
-          (let ((columns
-                 (mapcar
-                  (lambda (row) (nth 1 row))
-                  (sqlite-select database "PRAGMA table_info(posts)"))))
-            (should (member "like_can_act" columns))
-            (should (member "like_can_undo" columns))))
-      (sqlite-close database))))
-
 (ert-deftest nndiscourse-test-message-ids-and-references-are-deterministic ()
   (nndiscourse-test--with-database
     (let* ((root

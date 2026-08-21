@@ -80,26 +80,25 @@
                    :time 1787000001 :title "Official fallback"
                    :score 7 :descendants 0))
                 (_ nil))))
-           ((symbol-function 'nnhackernews--algolia-story-hits)
-            (lambda (ids)
-              (delq
-               nil
-               (mapcar
-                (lambda (id)
-                  (pcase id
-                    (2 (nnhackernews-test--story
-                        2 :title "Ask HN: Test"
-                        :tags '("story" "ask_hn")))
-                    (3 (nnhackernews-test--story
-                        3 :title "Show HN: Test"
-                        :tags '("story" "show_hn")))
-                    (5 (nnhackernews-test--story 5 :title "Regular"))))
-                ids))))
-           ((symbol-function 'nnhackernews--algolia-job-hits)
-            (lambda ()
-              (list
-               (nnhackernews-test--story
-                4 :title "Example is hiring" :tags '("job"))))))
+           ((symbol-function 'nnhackernews--algolia-root-hits)
+            (lambda (group ids)
+              (if (equal group "job")
+                  (list
+                   (nnhackernews-test--story
+                    4 :title "Example is hiring" :tags '("job")))
+                (delq
+                 nil
+                 (mapcar
+                  (lambda (id)
+                    (pcase id
+                      (2 (nnhackernews-test--story
+                          2 :title "Ask HN: Test"
+                          :tags '("story" "ask_hn")))
+                      (3 (nnhackernews-test--story
+                          3 :title "Show HN: Test"
+                          :tags '("story" "show_hn")))
+                      (5 (nnhackernews-test--story 5 :title "Regular"))))
+                  ids))))))
         (should (= (nnhackernews--sync-stories) 5))
         (should (equal fallback-calls '(1)))
         (should
@@ -218,7 +217,8 @@
               (((symbol-function 'nnhackernews--possibly-open) #'ignore)
                ((symbol-function 'nnhackernews--sync-thread)
                 (lambda (&rest _)
-                  (signal 'nnhackernews-http-error '(503 "unavailable")))))
+                  (signal 'nnextension-core-http-error
+                          '(503 "unavailable")))))
             (should
              (equal
               (nnhackernews-request-article

@@ -22,7 +22,6 @@
 (require 'dom)
 (require 'json)
 (require 'nnheader)
-(require 'seq)
 (require 'shr)
 (require 'sqlite)
 (require 'subr-x)
@@ -53,15 +52,11 @@
 (defun nnextension-core--safe-error-detail (error-data sensitive-values)
   "Return one safe line from ERROR-DATA, redacting SENSITIVE-VALUES."
   (let ((detail
-         (or (car
-              (split-string
-               (error-message-string error-data) "[\r\n]" t))
-             "unknown error")))
+         (car (split-string (error-message-string error-data) "[\r\n]" t))))
     (dolist (value sensitive-values)
-      (when (and (stringp value) (not (string-empty-p value)))
-        (setq detail
-              (replace-regexp-in-string
-               (regexp-quote value) "<redacted>" detail t t))))
+      (setq detail
+            (replace-regexp-in-string
+             (regexp-quote value) "<redacted>" detail t t)))
     detail))
 
 (cl-defun nnextension-core-json-request
@@ -110,19 +105,12 @@ REQUEST-TARGET replaces URL in user-facing transport errors."
             (goto-char url-http-end-of-headers)
             (skip-chars-forward "\r\n")
             (unless (eobp)
-              (condition-case nil
-                  (setq parsed
-                        (json-parse-buffer
-                         :object-type 'plist
-                         :array-type 'list
-                         :null-object nil
-                         :false-object :false))
-                (json-parse-error
-                 (when (and (>= status 200) (< status 300))
-                   (signal
-                    error-type
-                    (list status
-                          (format "%s returned malformed JSON" service)))))))
+              (setq parsed
+                    (json-parse-buffer
+                     :object-type 'plist
+                     :array-type 'list
+                     :null-object nil
+                     :false-object :false)))
             (if (and (>= status 200) (< status 300))
                 parsed
               (let ((fallback (format "%s returned HTTP %s" service status)))
@@ -165,61 +153,32 @@ REQUEST-TARGET replaces URL in user-facing transport errors."
     ON CONFLICT(key) DO UPDATE SET value = excluded.value"
    (vector key (format "%s" value))))
 
-(defun nnextension-core-ensure-column
-    (database table column declaration)
-  "Ensure TABLE in DATABASE has COLUMN with SQL DECLARATION."
-  (unless
-      (seq-some
-       (lambda (row) (equal (nth 1 row) column))
-       (sqlite-select database (format "PRAGMA table_info(%s)" table)))
-    (sqlite-execute
-     database
-     (format "ALTER TABLE %s ADD COLUMN %s %s"
-             table column declaration))))
-
 (defun nnextension-core-sanitize-header (value)
   "Return VALUE without characters that can inject a mail header."
-  (replace-regexp-in-string "[\r\n]+" " " (or value "") t t))
+  (replace-regexp-in-string "[\r\n]+" " " value t t))
 
 (defun nnextension-core-html-to-text (html &optional ignored-classes)
   "Return compact plain text rendered from HTML.
 Nodes whose class is in IGNORED-CLASSES are removed before rendering."
-  (if (string-empty-p (or html ""))
-      ""
-    (condition-case nil
-        (with-temp-buffer
-          (insert html)
-          (let ((document
-                 (libxml-parse-html-region (point-min) (point-max))))
-            (dolist (class ignored-classes)
-              (dolist
-                  (node
-                   (dom-by-class
-                    document
-                    (format
-                     "\\(?:^\\|[[:space:]]\\)%s\\(?:$\\|[[:space:]]\\)"
-                     (regexp-quote class))))
-                (dom-remove-node document node)))
-            (erase-buffer)
-            (let ((shr-inhibit-images t)
-                  (shr-use-colors nil)
-                  (shr-use-fonts nil)
-                  (shr-width 10000))
-              (shr-insert-document document))
-            (string-trim
-             (replace-regexp-in-string
-              "[[:space:]]+" " " (buffer-string)))))
-      (error
-       (string-trim
-        (replace-regexp-in-string
-         "[[:space:]]+" " "
-         (replace-regexp-in-string "<[^>]+>" " " html)))))))
+  (with-temp-buffer
+    (insert html)
+    (let ((document (libxml-parse-html-region (point-min) (point-max))))
+      (dolist (class ignored-classes)
+        (dolist (node (dom-by-class document class))
+          (dom-remove-node document node)))
+      (erase-buffer)
+      (let ((shr-inhibit-images t)
+            (shr-use-colors nil)
+            (shr-use-fonts nil)
+            (shr-width 10000))
+        (shr-insert-document document))
+      (string-trim
+       (replace-regexp-in-string "[[:space:]]+" " " (buffer-string))))))
 
 (defun nnextension-core-mail-from (username host &optional display-name)
   "Return a mail-style From value for USERNAME at HOST.
 DISPLAY-NAME defaults to USERNAME."
   (let* ((username (nnextension-core-sanitize-header username))
-         (username (if (string-empty-p username) "unknown" username))
          (display-name
           (nnextension-core-sanitize-header (or display-name username)))
          (display-name
@@ -227,6 +186,31 @@ DISPLAY-NAME defaults to USERNAME."
     (format "\"%s\" <%s@%s>"
             (replace-regexp-in-string "[\"\\\\]" "\\\\\\&" display-name)
             username host)))
+
+(defun nnextension-core-insert-html-article
+    (buffer group header permalink base-url extra-headers body)
+  "Insert one HTML article into BUFFER.
+GROUP and HEADER supply its standard mail headers.  PERMALINK is used for
+Archived-At and Content-Base.  BASE-URL resolves relative links.  Insert
+EXTRA-HEADERS before the MIME headers and wrap BODY in an HTML document."
+  (with-current-buffer buffer
+    (erase-buffer)
+    (insert "Newsgroups: " group "\n"
+            "Subject: " (mail-header-subject header) "\n"
+            "From: " (mail-header-from header) "\n"
+            "Date: " (mail-header-date header) "\n"
+            "Message-ID: " (mail-header-id header) "\n")
+    (unless (string-empty-p (mail-header-references header))
+      (insert "References: " (mail-header-references header) "\n"))
+    (insert "Archived-At: " permalink "\n")
+    (dolist (field extra-headers)
+      (insert (car field) ": " (cdr field) "\n"))
+    (insert "MIME-Version: 1.0\n"
+            "Content-Type: text/html; charset=utf-8\n"
+            "Content-Transfer-Encoding: 8bit\n"
+            "Content-Base: " permalink "\n\n"
+            "<html><head><base href=\"" base-url
+            "/\"></head><body>\n" body "\n</body></html>\n")))
 
 (provide 'nnextension-core)
 

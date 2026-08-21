@@ -202,10 +202,6 @@ Valid values are `auto', `anonymous', `api-key', and `user-api-key'.")
   "Return the database file used for virtual SERVER."
   (nnextension-core-database-file nndiscourse-directory server))
 
-(defun nndiscourse--ensure-column (database table column declaration)
-  "Ensure TABLE in DATABASE has COLUMN with SQL DECLARATION."
-  (nnextension-core-ensure-column database table column declaration))
-
 (defun nndiscourse--initialize-database (database)
   "Create the nndiscourse schema in DATABASE."
   (nnextension-core-initialize-metadata database)
@@ -251,10 +247,6 @@ Valid values are `auto', `anonymous', `api-key', and `user-api-key'.")
       UNIQUE(category_id, article_no),
       UNIQUE(topic_id, post_number)
     )")
-  (nndiscourse--ensure-column
-   database "posts" "like_can_act" "INTEGER NOT NULL DEFAULT 0")
-  (nndiscourse--ensure-column
-   database "posts" "like_can_undo" "INTEGER NOT NULL DEFAULT 0")
   (sqlite-execute
    database
    "INSERT INTO categories
@@ -1206,37 +1198,21 @@ Return the refreshed post, falling back to POST on transient errors."
            (permalink (and post (nndiscourse--permalink post))))
       (unless header
         (error "No such article: %s" article))
-      (with-current-buffer (or buffer nntp-server-buffer)
-        (erase-buffer)
-        (insert "Newsgroups: " group "\n"
-                "Subject: " (mail-header-subject header) "\n"
-                "From: " (mail-header-from header) "\n"
-                "Date: " (mail-header-date header) "\n"
-                "Message-ID: " (mail-header-id header) "\n")
-        (unless (string-empty-p (mail-header-references header))
-          (insert "References: " (mail-header-references header) "\n"))
-        (insert "Archived-At: " permalink "\n"
-                "X-Discourse-Post-ID: "
-                (number-to-string (plist-get post :remote-id)) "\n"
-                "X-Discourse-Topic-ID: "
-                (number-to-string (plist-get post :topic-id)) "\n"
-                "X-Discourse-Post-Number: "
-                (number-to-string (plist-get post :post-number)) "\n"
-                "X-Discourse-Likes: "
-                (number-to-string (plist-get post :like-count))
-                "\nX-Discourse-Liked: "
-                (if (= (plist-get post :liked) 1) "yes" "no")
-                "\n"
-                "MIME-Version: 1.0\n"
-                "Content-Type: text/html; charset=utf-8\n"
-                "Content-Transfer-Encoding: 8bit\n"
-                "Content-Base: " permalink "\n\n"
-                "<html><head><base href=\""
-                nndiscourse-base-url
-                "/\"></head><body>\n"
-                (or (plist-get post :cooked)
-                    "<p>This post has no available body.</p>")
-                "\n</body></html>\n"))
+      (nnextension-core-insert-html-article
+       (or buffer nntp-server-buffer) group header permalink
+       nndiscourse-base-url
+       `(("X-Discourse-Post-ID"
+          . ,(number-to-string (plist-get post :remote-id)))
+         ("X-Discourse-Topic-ID"
+          . ,(number-to-string (plist-get post :topic-id)))
+         ("X-Discourse-Post-Number"
+          . ,(number-to-string (plist-get post :post-number)))
+         ("X-Discourse-Likes"
+          . ,(number-to-string (plist-get post :like-count)))
+         ("X-Discourse-Liked"
+          . ,(if (= (plist-get post :liked) 1) "yes" "no")))
+       (or (plist-get post :cooked)
+           "<p>This post has no available body.</p>"))
       (cons group (plist-get post :article-no)))))
 
 (defun nndiscourse--decode-message-body ()

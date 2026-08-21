@@ -50,16 +50,6 @@
 (ert-deftest nnextension-core-test-json-errors-and-redaction ()
   (cl-letf (((symbol-function 'url-retrieve-synchronously)
              (lambda (&rest _)
-               (nnextension-core-test--http-buffer 200 "not-json"))))
-    (let ((error
-           (should-error
-            (nnextension-core-json-request
-             "GET" "https://example.test/bad" :service "Example")
-            :type 'nnextension-core-http-error)))
-      (should (= (nth 1 error) 200))
-      (should (equal (nth 2 error) "Example returned malformed JSON"))))
-  (cl-letf (((symbol-function 'url-retrieve-synchronously)
-             (lambda (&rest _)
                (nnextension-core-test--http-buffer
                 422 "{\"message\":\"bad query\"}"))))
     (let ((error
@@ -94,18 +84,7 @@
           (nnextension-core-initialize-metadata database)
           (nnextension-core-metadata-set database "cursor" 42)
           (should
-           (equal (nnextension-core-metadata-get database "cursor") "42"))
-          (sqlite-execute database "CREATE TABLE example (id INTEGER)")
-          (nnextension-core-ensure-column
-           database "example" "name" "TEXT")
-          (nnextension-core-ensure-column
-           database "example" "name" "TEXT")
-          (should
-           (member
-            "name"
-            (mapcar
-             (lambda (row) (nth 1 row))
-             (sqlite-select database "PRAGMA table_info(example)")))))
+           (equal (nnextension-core-metadata-get database "cursor") "42")))
       (sqlite-close database))))
 
 (ert-deftest nnextension-core-test-text-and-mail-helpers ()
