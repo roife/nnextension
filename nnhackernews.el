@@ -117,13 +117,11 @@
 
 (defconst nnhackernews--item-columns
   '(:id :group-name :article-no :story-id :parent-id :type :author
-    :created-at :title :text :url :score :descendants :deleted :dead
-    :fetched-at))
+    :created-at :title :text :url :score :descendants :deleted :dead))
 
 (defconst nnhackernews--item-select
   "SELECT id, group_name, article_no, story_id, parent_id, type, author,
-          created_at, title, text, url, score, descendants, deleted, dead,
-          fetched_at
+          created_at, title, text, url, score, descendants, deleted, dead
      FROM items WHERE ")
 
 (defvar-keymap nnhackernews-mode-map
@@ -157,7 +155,6 @@
       descendants INTEGER,
       deleted INTEGER NOT NULL DEFAULT 0,
       dead INTEGER NOT NULL DEFAULT 0,
-      fetched_at INTEGER NOT NULL,
       UNIQUE(group_name, article_no)
     )")
   (sqlite-execute
@@ -204,23 +201,15 @@
                 (plist-get item :objectID))))
     (if (stringp id) (string-to-number id) id)))
 
-(defun nnhackernews--tagged-p (item tag)
-  "Return non-nil when Algolia ITEM has TAG."
-  (member tag (plist-get item :_tags)))
-
 (defun nnhackernews--item-type (item)
   "Return a normalized type string for remote ITEM."
   (or (plist-get item :type)
-      (cond
-       ((nnhackernews--tagged-p item "comment") "comment")
-       ((nnhackernews--tagged-p item "job") "job")
-       (t "story"))))
+      (if (member "comment" (plist-get item :_tags)) "comment" "story")))
 
 (defun nnhackernews--normalize-item (item group story-id)
   "Normalize remote ITEM for GROUP and STORY-ID."
   (let* ((id (nnhackernews--remote-id item))
          (type (nnhackernews--item-type item))
-         (root-p (not (equal type "comment")))
          (author (or (plist-get item :author) (plist-get item :by)))
          (text (or (plist-get item :text)
                    (plist-get item :story_text)
@@ -235,9 +224,7 @@
     (list
      :id id
      :group-name group
-     :story-id (or story-id
-                   (plist-get item :story_id)
-                   (and root-p id))
+     :story-id story-id
      :parent-id (or (plist-get item :parent_id)
                     (plist-get item :parent))
      :type type
@@ -257,19 +244,15 @@
   "Insert or update REMOTE in GROUP for STORY-ID."
   (let* ((normalized (nnhackernews--normalize-item remote group story-id))
          (id (plist-get normalized :id))
-         (existing (and id (nnhackernews--item-by-id id)))
-         (group (or (plist-get existing :group-name)
-                    (plist-get normalized :group-name)))
+         (existing (nnhackernews--item-by-id id))
          (article-no (or (plist-get existing :article-no)
-                         (nnhackernews--next-article-number group)))
-         (now (time-convert nil 'integer)))
+                         (nnhackernews--next-article-number group))))
     (sqlite-execute
      nnhackernews--database
      "INSERT INTO items
         (id, group_name, article_no, story_id, parent_id, type, author,
-         created_at, title, text, url, score, descendants, deleted, dead,
-         fetched_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         created_at, title, text, url, score, descendants, deleted, dead)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
         parent_id = excluded.parent_id,
         author = excluded.author,
@@ -280,8 +263,7 @@
         score = excluded.score,
         descendants = COALESCE(excluded.descendants, items.descendants),
         deleted = excluded.deleted,
-        dead = excluded.dead,
-        fetched_at = excluded.fetched_at"
+        dead = excluded.dead"
      (vector
       id group article-no (plist-get normalized :story-id)
       (plist-get normalized :parent-id) (plist-get normalized :type)
@@ -289,7 +271,7 @@
       (plist-get normalized :title) (plist-get normalized :text)
       (plist-get normalized :url) (plist-get normalized :score)
       (plist-get normalized :descendants) (plist-get normalized :deleted)
-      (plist-get normalized :dead) now))
+      (plist-get normalized :dead)))
     (nnhackernews--item-by-id id)))
 
 (defun nnhackernews--firebase-url (path)
@@ -455,17 +437,10 @@ Finish immediately when ERRORS is non-nil."
 
 (defun nnhackernews--comment-cursor (database story-id direction)
   "Return the comment cursor in DATABASE for STORY-ID and DIRECTION."
-  (or (when-let* ((value
-                   (nnhackernews--thread-metadata-get
-                    database story-id direction)))
-        (string-to-number value))
-      (caar
-       (sqlite-select
-        database
-        (format "SELECT %s(created_at) FROM items
-                  WHERE story_id = ? AND type = 'comment'"
-                (if (equal direction "newest") "MAX" "MIN"))
-        (vector story-id)))))
+  (when-let* ((value
+               (nnhackernews--thread-metadata-get
+                database story-id direction)))
+    (string-to-number value)))
 
 (defun nnhackernews--comment-url (sync)
   "Return the next Algolia comment URL for SYNC."

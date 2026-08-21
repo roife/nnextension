@@ -396,56 +396,47 @@
 
 (ert-deftest nndiscourse-test-category-sync-flattens-subcategories ()
   (nndiscourse-test--with-database
-    (cl-letf (((symbol-function 'nndiscourse--request)
-               (lambda (&rest _)
-                 '(:category_list
-                   (:categories
-                    ((:id 1 :slug "parent" :name "Parent"
-                      :description_text "Top"
-                      :position 1
-                      :subcategory_list
-                      ((:id 2 :slug "child" :name "Child"
-                        :description_text "Nested"
-                        :parent_category_id 1 :position 2)))))))))
-      (nndiscourse--sync-categories)
-      (should
-       (equal
-        (sqlite-select
-         nndiscourse--database
-         "SELECT id, name, parent_id FROM categories
-           WHERE id > 0 ORDER BY id")
-        '((1 "Parent" nil) (2 "Child" 1)))))))
+    (nndiscourse--store-categories
+     '(:category_list
+       (:categories
+        ((:id 1 :slug "parent" :name "Parent"
+          :description_text "Top" :position 1
+          :subcategory_list
+          ((:id 2 :slug "child" :name "Child"
+            :description_text "Nested"
+            :parent_category_id 1 :position 2)))))))
+    (should
+     (equal
+      (sqlite-select
+       nndiscourse--database
+       "SELECT id, name, parent_id FROM categories
+         WHERE id > 0 ORDER BY id")
+      '((1 "Parent" nil) (2 "Child" 1))))))
 
-(ert-deftest nndiscourse-test-initial-and-incremental-sync ()
-  (nndiscourse-test--with-database
-    (let ((nndiscourse-initial-sync-limit 3)
-          (initial
-           (list (nndiscourse-test--post 3 :number 3)
-                 (nndiscourse-test--post 2 :number 2)
-                 (nndiscourse-test--post 1 :number 1))))
-      (cl-letf (((symbol-function 'nndiscourse--fetch-post-page)
-                 (lambda (&optional before)
-                   (unless before initial))))
-        (should (= (nndiscourse--initial-sync) 3)))
-      (should
-       (equal
-        (sqlite-select nndiscourse--database
-                       "SELECT remote_id, article_no FROM posts
-                         ORDER BY article_no")
-        '((1 1) (2 2) (3 3))))
-      (cl-letf (((symbol-function 'nndiscourse--fetch-post-page)
-                 (lambda (&optional before)
-                   (unless before
-                     (list (nndiscourse-test--post 5 :number 5)
-                           (nndiscourse-test--post 4 :number 4)
-                           (nndiscourse-test--post 3 :number 3))))))
-        (should (= (nndiscourse--incremental-sync) 2)))
-      (should
-       (equal
-        (sqlite-select nndiscourse--database
-                       "SELECT remote_id, article_no FROM posts
-                         ORDER BY article_no")
-        '((1 1) (2 2) (3 3) (4 4) (5 5)))))))
+(ert-deftest nndiscourse-test-background-post-page-state ()
+  (let* ((page (list (nndiscourse-test--post 3 :number 3)
+                     (nndiscourse-test--post 2 :number 2)
+                     (nndiscourse-test--post 1 :number 1)))
+         (initial (make-nndiscourse--background-sync
+                   :initial t :remaining 3))
+         (incremental (make-nndiscourse--background-sync
+                       :cursor 1)))
+    (cl-letf (((symbol-function 'nndiscourse--maybe-finish-background-sync)
+               #'ignore))
+      (nndiscourse--background-post-result initial `(:latest_posts ,page) nil)
+      (should (nndiscourse--background-sync-posts-done initial))
+      (should (= (length (nndiscourse--background-sync-posts initial)) 3))
+      (nndiscourse--background-post-result
+       incremental
+       `(:latest_posts
+         (,(nndiscourse-test--post 3 :number 3)
+          ,(nndiscourse-test--post 2 :number 2)
+          ,(nndiscourse-test--post 1 :number 1)))
+       nil)
+      (should (nndiscourse--background-sync-posts-done incremental))
+      (should (= (length
+                  (nndiscourse--background-sync-new-posts incremental))
+                 2)))))
 
 (ert-deftest nndiscourse-test-nov-and-html-article-generation ()
   (nndiscourse-test--with-database

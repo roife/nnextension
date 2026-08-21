@@ -595,12 +595,6 @@ the request if no credentials are configured."
             (plist-get category :subcategory_list))))
    categories))
 
-(defun nndiscourse--sync-categories ()
-  "Refresh the current server's category metadata."
-  (nndiscourse--store-categories
-   (nndiscourse--request
-    "GET" "/categories.json?include_subcategories=true")))
-
 (defun nndiscourse--store-categories (response)
   "Store categories from RESPONSE in the current database."
   (let* ((categories
@@ -785,60 +779,6 @@ CONTEXT supplies values omitted by single-post API responses."
   (with-sqlite-transaction nndiscourse--database
     (dolist (post (seq-sort-by #'nndiscourse--post-id #'< posts))
       (nndiscourse--upsert-post post))))
-
-(defun nndiscourse--initial-sync ()
-  "Fetch the initial recent-post window for the current server."
-  (let ((remaining nndiscourse-initial-sync-limit)
-        before posts page oldest)
-    (while (> remaining 0)
-      (setq page (nndiscourse--fetch-post-page before))
-      (if (null page)
-          (setq remaining 0)
-        (setq page (seq-take page remaining)
-              posts (nconc posts page)
-              oldest (seq-min (mapcar #'nndiscourse--post-id page))
-              remaining (- remaining (length page)))
-        (if (or (< (length page) nndiscourse--page-size)
-                (equal before oldest))
-            (setq remaining 0)
-          (setq before oldest))))
-    (when posts
-      (nndiscourse--insert-posts posts)
-      (let ((ids (mapcar #'nndiscourse--post-id posts)))
-        (nndiscourse--metadata-set "newest_remote_id" (seq-max ids))
-        (nndiscourse--metadata-set "oldest_remote_id" (seq-min ids))))
-    (nndiscourse--metadata-set "initial_sync_complete" "1")
-    (length posts)))
-
-(defun nndiscourse--incremental-sync ()
-  "Fetch posts newer than the current server cursor."
-  (let ((cursor (string-to-number
-                 (or (nndiscourse--metadata-get "newest_remote_id") "0")))
-        before posts updates page done)
-    (while (not done)
-      (setq page (nndiscourse--fetch-post-page before))
-      (if (null page)
-          (setq done t)
-        (let* ((minimum
-                (seq-min (mapcar #'nndiscourse--post-id page)))
-               (new
-                (seq-filter
-                 (lambda (post) (> (nndiscourse--post-id post) cursor))
-                 page)))
-          ;; Upserting the boundary page also refreshes recent edits.
-          (setq posts (nconc posts new)
-                updates (nconc updates page))
-          (if (or (<= minimum cursor)
-                  (equal before minimum))
-              (setq done t)
-            (setq before minimum)))))
-    (when updates
-      (nndiscourse--insert-posts updates))
-    (when posts
-      (nndiscourse--metadata-set
-       "newest_remote_id"
-       (seq-max (mapcar #'nndiscourse--post-id posts))))
-    (length posts)))
 
 (defun nndiscourse--fetch-older-pages (pages)
   "Fetch PAGES pages older than the current oldest cursor."

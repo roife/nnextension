@@ -34,7 +34,7 @@
 (define-error 'nnextension-core-http-error "nnextension HTTP error")
 
 (cl-defstruct nnextension-core-batch
-  pending results errors callback done)
+  pending results errors callback)
 
 (defmacro nnextension-core-with-report (backend &rest body)
   "Run BODY, reporting errors through Gnus BACKEND."
@@ -180,7 +180,6 @@ REQUEST-TARGET replaces URL in user-facing transport errors."
     (push (cons key data) (nnextension-core-batch-results batch)))
   (cl-decf (nnextension-core-batch-pending batch))
   (when (zerop (nnextension-core-batch-pending batch))
-    (setf (nnextension-core-batch-done batch) t)
     (funcall (nnextension-core-batch-callback batch)
              (nreverse (nnextension-core-batch-results batch))
              (nreverse (nnextension-core-batch-errors batch)))))
@@ -204,7 +203,6 @@ by `nnextension-core-json-request-async'."
                   unless (memq name '(:key :method :url))
                   append (list name value)))))
     (when (null requests)
-      (setf (nnextension-core-batch-done batch) t)
       (funcall callback nil nil))
     batch))
 

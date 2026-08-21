@@ -13,19 +13,28 @@
          (nndiscourse-directory directory)
          (nndiscourse-base-url (string-trim-right url "/+"))
          (nndiscourse-auth-type 'anonymous)
-         (nndiscourse--database (sqlite-open)))
+         (nndiscourse-initial-sync-limit 50)
+         (file (nnextension-core-database-file directory "smoke"))
+         nndiscourse--database)
     (unwind-protect
         (progn
-          (nndiscourse--initialize-database nndiscourse--database)
-          (let ((categories (nndiscourse--sync-categories))
-                (posts (nndiscourse--fetch-post-page)))
-            (unless categories
-              (error "Discourse smoke test returned no categories"))
-            (unless posts
-              (error "Discourse smoke test returned no posts"))
-            (princ
-             (format "Discourse smoke: %d categories, %d recent posts\n"
-                     (length categories) (length posts)))))
+          (cl-letf (((symbol-function 'nndiscourse--publish-active) #'ignore))
+            (nndiscourse--start-background-sync "smoke")
+            (url-queue-run-queue)
+            (while (> (hash-table-count nndiscourse--background-syncs) 0)
+              (accept-process-output nil 0.05)
+              (url-queue-run-queue)))
+          (setq nndiscourse--database (sqlite-open file))
+          (let ((categories
+                 (caar (sqlite-select nndiscourse--database
+                                      "SELECT COUNT(*) FROM categories")))
+                (posts
+                 (caar (sqlite-select nndiscourse--database
+                                      "SELECT COUNT(*) FROM posts"))))
+            (unless (and (> categories 1) (> posts 0))
+              (error "Discourse smoke test returned incomplete data"))
+            (princ (format "Discourse smoke: %d categories, %d recent posts\n"
+                           categories posts))))
       (when (sqlitep nndiscourse--database)
         (sqlite-close nndiscourse--database))
       (delete-directory directory t))))
