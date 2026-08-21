@@ -34,6 +34,7 @@
 (require 'xml)
 
 (declare-function gnus-summary-article-number "gnus-sum")
+(declare-function gnus-summary-buffer-name "gnus-sum" (group))
 (declare-function gnus-summary-reselect-current-group "gnus-sum"
                   (&optional all no-article))
 
@@ -659,10 +660,13 @@ THREAD-FETCHED-AT records completion of a root thread download."
           (nnheader-insert-nov header))))
     'nov))
 
-(defun nnhackernews--schedule-reselect (group)
-  "Schedule a summary reselect for GROUP after article display finishes."
-  (when (buffer-live-p gnus-summary-buffer)
-    (let ((summary gnus-summary-buffer))
+(defun nnhackernews--schedule-reselect (group server)
+  "Schedule a summary reselect for GROUP on SERVER."
+  (let ((summary
+         (get-buffer
+          (gnus-summary-buffer-name
+           (gnus-group-full-name group `(nnhackernews ,server))))))
+    (when summary
       (run-at-time
        0 nil
        (lambda ()
@@ -675,7 +679,7 @@ THREAD-FETCHED-AT records completion of a root thread download."
     (article &optional group server buffer)
   "Retrieve ARTICLE from GROUP on SERVER into BUFFER."
   (nnhackernews--with-report
-    (nnhackernews--possibly-open server)
+    (setq server (nnhackernews--possibly-open server))
     (setq group (or group nnhackernews--current-group))
     (let* ((item
             (if (stringp article)
@@ -689,7 +693,7 @@ THREAD-FETCHED-AT records completion of a root thread download."
             (let ((new (nnhackernews--sync-thread (plist-get item :story-id))))
               (setq item (nnhackernews--item-by-id (plist-get item :id)))
               (when (> new 0)
-                (nnhackernews--schedule-reselect group)))
+                (nnhackernews--schedule-reselect group server)))
           (nnextension-core-http-error
            (nnheader-message
             3 "nnhackernews: could not load comments: %s"

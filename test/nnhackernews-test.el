@@ -185,7 +185,7 @@
                    (vector story-id))
                   1))
                ((symbol-function 'nnhackernews--schedule-reselect)
-                (lambda (_group) (cl-incf reselect-count))))
+                (lambda (_group _server) (cl-incf reselect-count))))
             (should
              (equal
               (nnhackernews-request-article
@@ -205,6 +205,26 @@
               (should (search-forward
                        "https://example.test/story" nil t))))
         (kill-buffer output)))))
+
+(ert-deftest nnhackernews-test-reselects-the-real-summary-buffer ()
+  (let* ((group "nnhackernews:show")
+         (summary
+          (get-buffer-create (gnus-summary-buffer-name group)))
+         (reselects 0))
+    (unwind-protect
+        (progn
+          (with-current-buffer summary
+            (setq-local gnus-newsgroup-name group))
+          (cl-letf
+              (((symbol-function 'run-at-time)
+                (lambda (_time _repeat function &rest arguments)
+                  (apply function arguments)))
+               ((symbol-function 'gnus-summary-reselect-current-group)
+                (lambda (&rest _) (cl-incf reselects))))
+            (let ((gnus-summary-buffer "*Summary*"))
+              (nnhackernews--schedule-reselect "show" "")))
+          (should (= reselects 1)))
+      (kill-buffer summary))))
 
 (ert-deftest nnhackernews-test-first-open-falls-back-to-cached-root ()
   (nnhackernews-test--with-database
