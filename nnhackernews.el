@@ -37,6 +37,8 @@
 (declare-function gnus-summary-buffer-name "gnus-sum" (group))
 (declare-function gnus-summary-reselect-current-group "gnus-sum"
                   (&optional all no-article))
+(declare-function gnus-group-update-group "gnus-group"
+                  (group &optional visible-only info-unchanged))
 
 (defgroup nnhackernews nil
   "Read Hacker News through Gnus."
@@ -79,6 +81,10 @@
 (defvoo nnhackernews--database nil)
 (defvoo nnhackernews--current-group nil)
 (defvoo nnhackernews-status-string "")
+
+(cl-defstruct nnhackernews--background-sync server database feeds)
+
+(defvar nnhackernews--background-syncs (make-hash-table :test #'equal))
 
 (defconst nnhackernews--firebase-base-url
   "https://hacker-news.firebaseio.com/v0")
@@ -302,14 +308,20 @@ THREAD-FETCHED-AT records completion of a root thread download."
 
 (defun nnhackernews--firebase-request (path)
   "Return parsed Firebase JSON at PATH."
-  (nnhackernews--request
-   (format "%s/%s.json" nnhackernews--firebase-base-url path)))
+  (nnhackernews--request (nnhackernews--firebase-url path)))
+
+(defun nnhackernews--firebase-url (path)
+  "Return the Firebase URL for PATH."
+  (format "%s/%s.json" nnhackernews--firebase-base-url path))
 
 (defun nnhackernews--algolia-request (path &optional query)
   "Return parsed Algolia JSON at PATH with optional QUERY alist."
-  (nnhackernews--request
-   (concat nnhackernews--algolia-base-url path
-           (and query (concat "?" (url-build-query-string query))))))
+  (nnhackernews--request (nnhackernews--algolia-url path query)))
+
+(defun nnhackernews--algolia-url (path &optional query)
+  "Return the Algolia URL for PATH and QUERY."
+  (concat nnhackernews--algolia-base-url path
+          (and query (concat "?" (url-build-query-string query)))))
 
 (defun nnhackernews--algolia-root-hits (group ids)
   "Return Algolia root hits for GROUP matching official feed IDS."
@@ -380,15 +392,184 @@ THREAD-FETCHED-AT records completion of a root thread download."
     (dolist (feed feeds)
       (dolist (root (nnhackernews--fetch-root-items (car feed) (cdr feed)))
         (push (cons (car feed) root) roots)))
+    (nnhackernews--store-roots nnhackernews--database roots)))
+
+(defun nnhackernews--store-roots (database roots)
+  "Store ROOTS in DATABASE and return their count."
+  (let ((nnhackernews--database database))
     (setq roots
           (seq-sort-by
            (lambda (entry) (nnhackernews--remote-id (cdr entry))) #'<
            roots))
-    (with-sqlite-transaction nnhackernews--database
+    (with-sqlite-transaction database
       (dolist (entry roots)
         (nnhackernews--upsert-item
          (cdr entry) (car entry) (nnhackernews--remote-id (cdr entry)))))
     (length roots)))
+
+(defun nnhackernews--async-get (key url)
+  "Return a background JSON request for KEY and URL."
+  `(:key ,key :method "GET" :url ,url
+    :headers (("User-Agent" . "nnextension-nnhackernews/0.1"))
+    :timeout ,nnhackernews-request-timeout :service "Hacker News"))
+
+(defun nnhackernews--background-root-requests (feeds)
+  "Return parallel Algolia requests for FEEDS."
+  (cl-mapcan
+   (lambda (feed)
+     (let ((group (car feed))
+           (ids (cdr feed)))
+       (if (equal group "job")
+           (list
+            (nnhackernews--async-get
+             (cons group 0)
+             (nnhackernews--algolia-url
+              "/search_by_date"
+              `(("tags" "job")
+                ("hitsPerPage" ,(number-to-string (length ids)))))))
+         (cl-loop
+          for chunk in (seq-partition ids nnhackernews--algolia-batch-size)
+          for index from 0
+          collect
+          (nnhackernews--async-get
+           (cons group index)
+           (nnhackernews--algolia-url
+            "/search_by_date"
+            `(("tags"
+               ,(format
+                 "story,(%s)"
+                 (mapconcat
+                  (lambda (id) (format "story_%d" id)) chunk ",")))
+              ("hitsPerPage" ,(number-to-string (length chunk))))))))))
+   feeds))
+
+(defun nnhackernews--background-root-table (results)
+  "Return an ID-indexed table of Algolia root RESULTS."
+  (let ((table (make-hash-table :test #'eql)))
+    (dolist (result results table)
+      (dolist (hit (plist-get (cdr result) :hits))
+        (puthash (nnhackernews--remote-id hit) hit table)))))
+
+(defun nnhackernews--background-roots (feeds table)
+  "Return grouped roots from FEEDS and ID-indexed TABLE."
+  (let (roots)
+    (dolist (id (cdr (assoc "news" feeds)))
+      (when-let* ((root (gethash id table)))
+        (when (and (< (length (alist-get "news" roots nil nil #'equal))
+                      nnhackernews-feed-limit)
+                   (equal (nnhackernews--classify-story root "news") "news"))
+          (push root (alist-get "news" roots nil nil #'equal)))))
+    (dolist (feed (cdr feeds))
+      (dolist (id (cdr feed))
+        (when-let* ((root (gethash id table)))
+          (push root (alist-get (car feed) roots nil nil #'equal)))))
+    (cl-mapcan
+     (lambda (feed)
+       (mapcar (lambda (root) (cons (car feed) root)) (cdr feed)))
+     roots)))
+
+(defun nnhackernews--publish-active (database server &optional update-buffer)
+  "Publish cached group ranges from DATABASE for SERVER.
+When UPDATE-BUFFER is non-nil, redraw existing Group buffer lines."
+  (let ((nnhackernews--database database)
+        groups)
+    (dolist (entry nnhackernews--groups)
+      (pcase-let* ((group (car entry))
+                   (full (gnus-group-full-name
+                          group `(nnhackernews ,server)))
+                   (`(,_count ,minimum ,maximum)
+                    (nnhackernews--group-stats group)))
+        (gnus-set-active full (cons minimum maximum))
+        (push full groups)))
+    (when-let* ((buffer (and update-buffer (get-buffer gnus-group-buffer))))
+      (with-current-buffer buffer
+        (dolist (group groups)
+          (gnus-group-update-group group nil nil))))))
+
+(defun nnhackernews--finish-background-sync (sync roots errors)
+  "Finish SYNC by storing ROOTS or reporting ERRORS."
+  (let ((server (nnhackernews--background-sync-server sync))
+        (database (nnhackernews--background-sync-database sync)))
+    (unwind-protect
+        (if errors
+            (nnheader-message
+             3 "nnhackernews background sync failed: %s"
+             (error-message-string (cdar errors)))
+          (let ((count (nnhackernews--store-roots database roots)))
+            (setq nnhackernews-status-string
+                  (format "Synchronized %d Hacker News stories" count))
+            (nnhackernews--publish-active database server t)
+            (nnheader-message 5 "%s" nnhackernews-status-string)))
+      (sqlite-close database)
+      (remhash server nnhackernews--background-syncs))))
+
+(defun nnhackernews--background-fallbacks (sync feeds results errors)
+  "Fetch roots missing from Algolia RESULTS for SYNC and FEEDS.
+Finish immediately when ERRORS is non-nil."
+  (if errors
+      (nnhackernews--finish-background-sync sync nil errors)
+    (let* ((table (nnhackernews--background-root-table results))
+           (ids (delete-dups (mapcan #'copy-sequence (mapcar #'cdr feeds))))
+           (missing (seq-remove (lambda (id) (gethash id table)) ids)))
+      (nnextension-core-json-batch
+       (mapcar
+        (lambda (id)
+          (nnhackernews--async-get
+           id (nnhackernews--firebase-url (format "item/%d" id))))
+        missing)
+       (lambda (fallbacks fallback-errors)
+         (dolist (fallback fallbacks)
+           (puthash (car fallback) (cdr fallback) table))
+         (nnhackernews--finish-background-sync
+          sync (nnhackernews--background-roots feeds table)
+          fallback-errors))))))
+
+(defun nnhackernews--background-feeds (sync results errors)
+  "Start root metadata requests for SYNC from feed RESULTS.
+Finish immediately when ERRORS is non-nil."
+  (if errors
+      (nnhackernews--finish-background-sync sync nil errors)
+    (let* ((new (alist-get 'new results))
+           (ask (alist-get 'ask results))
+           (show (alist-get 'show results))
+           (job (alist-get 'job results))
+           (special (append ask show job))
+           (feeds
+            `(("news" . ,(seq-take
+                          (seq-remove (lambda (id) (memq id special)) new)
+                          (+ nnhackernews-feed-limit
+                             nnhackernews--algolia-batch-size)))
+              ("ask" . ,(seq-take ask nnhackernews-feed-limit))
+              ("show" . ,(seq-take show nnhackernews-feed-limit))
+              ("job" . ,(seq-take job nnhackernews-feed-limit)))))
+      (setf (nnhackernews--background-sync-feeds sync) feeds)
+      (nnextension-core-json-batch
+       (nnhackernews--background-root-requests feeds)
+       (lambda (root-results root-errors)
+         (nnhackernews--background-fallbacks
+          sync feeds root-results root-errors))))))
+
+(defun nnhackernews--start-background-sync (server)
+  "Start or return the background synchronization for SERVER."
+  (or (gethash server nnhackernews--background-syncs)
+      (let* ((database
+              (sqlite-open
+               (nnextension-core-database-file nnhackernews-directory server)))
+             (sync
+              (make-nnhackernews--background-sync
+               :server server :database database)))
+        (nnhackernews--initialize-database database)
+        (puthash server sync nnhackernews--background-syncs)
+        (nnextension-core-json-batch
+         (mapcar
+          (lambda (feed)
+            (nnhackernews--async-get
+             (car feed) (nnhackernews--firebase-url (cdr feed))))
+          '((new . "newstories") (ask . "askstories")
+            (show . "showstories") (job . "jobstories")))
+         (lambda (results errors)
+           (nnhackernews--background-feeds sync results errors)))
+        sync)))
 
 (defun nnhackernews--flatten-thread (root)
   "Return ROOT and its recursive Algolia children as a flat list."
@@ -590,7 +771,10 @@ THREAD-FETCHED-AT records completion of a root thread download."
 (deffoo nnhackernews-request-list (&optional server)
   "Insert the active Hacker News group list for SERVER."
   (nnhackernews--with-report
-    (nnhackernews--possibly-open server)
+    (setq server (nnhackernews--possibly-open server))
+    (when (zerop (caar (sqlite-select nnhackernews--database
+                                      "SELECT COUNT(*) FROM items")))
+      (nnhackernews--start-background-sync server))
     (with-current-buffer nntp-server-buffer
       (erase-buffer)
       (dolist (entry nnhackernews--groups)
@@ -632,19 +816,29 @@ THREAD-FETCHED-AT records completion of a root thread download."
     t))
 
 (deffoo nnhackernews-request-scan (&optional _group server)
-  "Fetch current Hacker News story roots for SERVER."
+  "Start fetching Hacker News story roots for SERVER."
   (nnhackernews--with-report
-    (nnhackernews--possibly-open server)
-    (let ((count (nnhackernews--sync-stories)))
-      (setq nnhackernews-status-string
-            (format "Synchronized %d Hacker News stories" count))
-      (nnheader-report 'nnhackernews "%s" nnhackernews-status-string))
+    (setq server (nnhackernews--possibly-open server))
+    (nnhackernews--start-background-sync server)
+    (nnheader-report 'nnhackernews "Hacker News sync running in background")
     t))
 
 (deffoo nnhackernews-request-group-scan
     (_group &optional server _info)
   "Scan a Hacker News group on SERVER."
   (nnhackernews-request-scan nil server))
+
+(deffoo nnhackernews-retrieve-group-data-early (server infos)
+  "Start background retrieval for SERVER when INFOS is non-nil."
+  (when infos
+    (nnhackernews--start-background-sync
+     (nnhackernews--possibly-open server))))
+
+(deffoo nnhackernews-finish-retrieve-group-infos (server _infos _sync)
+  "Publish cached group ranges for SERVER without waiting for _SYNC."
+  (setq server (nnhackernews--possibly-open server))
+  (nnhackernews--publish-active nnhackernews--database server)
+  t)
 
 (deffoo nnhackernews-retrieve-headers
     (articles &optional group server _fetch-old)

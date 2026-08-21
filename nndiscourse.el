@@ -63,6 +63,8 @@
 (declare-function gnus-summary-rescan-group "gnus-sum" (&optional all))
 (declare-function gnus-summary-update-article-line "gnus-sum"
                   (article header))
+(declare-function gnus-group-update-group "gnus-group"
+                  (group &optional visible-only info-unchanged))
 
 (defvar url-http-end-of-headers)
 (defvar url-http-response-status)
@@ -135,6 +137,12 @@ Valid values are `auto', `anonymous', `api-key', and `user-api-key'.")
 (defvoo nndiscourse--database nil)
 (defvoo nndiscourse--current-group nil)
 (defvoo nndiscourse-status-string "")
+
+(cl-defstruct nndiscourse--background-sync
+  server database base-url auth-type initial cursor remaining before
+  categories categories-done posts updates new-posts posts-done errors)
+
+(defvar nndiscourse--background-syncs (make-hash-table :test #'equal))
 
 (defconst nndiscourse--page-size 50)
 
@@ -589,10 +597,13 @@ the request if no credentials are configured."
 
 (defun nndiscourse--sync-categories ()
   "Refresh the current server's category metadata."
-  (let* ((response
-          (nndiscourse--request
-           "GET" "/categories.json?include_subcategories=true"))
-         (categories
+  (nndiscourse--store-categories
+   (nndiscourse--request
+    "GET" "/categories.json?include_subcategories=true")))
+
+(defun nndiscourse--store-categories (response)
+  "Store categories from RESPONSE in the current database."
+  (let* ((categories
           (nndiscourse--category-list
            (plist-get (plist-get response :category_list) :categories)))
          (now (time-convert nil 'integer)))
@@ -853,6 +864,186 @@ CONTEXT supplies values omitted by single-post API responses."
       (nndiscourse--metadata-set "oldest_remote_id" before-string))
     (length posts)))
 
+(defun nndiscourse--background-get (sync path callback)
+  "Fetch PATH for SYNC and invoke CALLBACK with (DATA ERROR)."
+  (let* ((nndiscourse-base-url
+          (nndiscourse--background-sync-base-url sync))
+         (nndiscourse-auth-type
+          (nndiscourse--background-sync-auth-type sync))
+         (auth-headers (nndiscourse--auth-headers)))
+    (nnextension-core-json-request-async
+     "GET" (concat (nndiscourse--background-sync-base-url sync) path)
+     callback
+     :headers (append '(("User-Agent" . "nndiscourse/0.1")) auth-headers)
+     :timeout nndiscourse-request-timeout
+     :error-type 'nndiscourse-http-error
+     :service "Discourse"
+     :error-message-function #'nndiscourse--json-error-message
+     :sensitive-values (mapcar #'cdr auth-headers))))
+
+(defun nndiscourse--background-category-result (sync data error)
+  "Record category DATA or ERROR for SYNC."
+  (if error
+      (push error (nndiscourse--background-sync-errors sync))
+    (setf (nndiscourse--background-sync-categories sync) data))
+  (setf (nndiscourse--background-sync-categories-done sync) t)
+  (nndiscourse--maybe-finish-background-sync sync))
+
+(defun nndiscourse--background-post-result (sync data error)
+  "Record one post page DATA or ERROR for SYNC."
+  (if error
+      (progn
+        (push error (nndiscourse--background-sync-errors sync))
+        (setf (nndiscourse--background-sync-posts-done sync) t))
+    (let ((page (plist-get data :latest_posts)))
+      (if (nndiscourse--background-sync-initial sync)
+          (let* ((remaining (nndiscourse--background-sync-remaining sync))
+                 (selected (seq-take page remaining))
+                 (oldest (and selected
+                              (seq-min (mapcar #'nndiscourse--post-id
+                                               selected)))))
+            (setf (nndiscourse--background-sync-posts sync)
+                  (nconc (nndiscourse--background-sync-posts sync) selected)
+                  (nndiscourse--background-sync-remaining sync)
+                  (- remaining (length selected)))
+            (if (or (null selected)
+                    (zerop (nndiscourse--background-sync-remaining sync))
+                    (< (length page) nndiscourse--page-size)
+                    (equal oldest (nndiscourse--background-sync-before sync)))
+                (setf (nndiscourse--background-sync-posts-done sync) t)
+              (setf (nndiscourse--background-sync-before sync) oldest)
+              (nndiscourse--background-post-page sync)))
+        (if (null page)
+            (setf (nndiscourse--background-sync-posts-done sync) t)
+          (let* ((cursor (nndiscourse--background-sync-cursor sync))
+                 (minimum (seq-min (mapcar #'nndiscourse--post-id page)))
+                 (new (seq-filter
+                       (lambda (post)
+                         (> (nndiscourse--post-id post) cursor))
+                       page)))
+            (setf (nndiscourse--background-sync-new-posts sync)
+                  (nconc (nndiscourse--background-sync-new-posts sync) new)
+                  (nndiscourse--background-sync-updates sync)
+                  (nconc (nndiscourse--background-sync-updates sync) page))
+            (if (or (<= minimum cursor)
+                    (equal minimum
+                           (nndiscourse--background-sync-before sync)))
+                (setf (nndiscourse--background-sync-posts-done sync) t)
+              (setf (nndiscourse--background-sync-before sync) minimum)
+              (nndiscourse--background-post-page sync)))))))
+  (nndiscourse--maybe-finish-background-sync sync))
+
+(defun nndiscourse--background-post-page (sync)
+  "Start the next post-page request for SYNC."
+  (nndiscourse--background-get
+   sync
+   (if-let* ((before (nndiscourse--background-sync-before sync)))
+       (format "/posts.json?before=%d" before)
+     "/posts.json")
+   (lambda (data error)
+     (nndiscourse--background-post-result sync data error))))
+
+(defun nndiscourse--publish-active (database server &optional update-buffer)
+  "Publish cached category ranges from DATABASE for SERVER.
+When UPDATE-BUFFER is non-nil, redraw existing Group buffer lines."
+  (let (groups)
+    (dolist
+        (row
+         (sqlite-select
+          database
+          "SELECT c.id,
+                  COALESCE(MIN(CASE WHEN p.deleted = 0
+                                    THEN p.article_no END), 1),
+                  COALESCE(MAX(CASE WHEN p.deleted = 0
+                                    THEN p.article_no END), 0)
+             FROM categories c
+             LEFT JOIN posts p ON p.category_id = c.id
+            GROUP BY c.id"))
+      (pcase-let* ((`(,id ,minimum ,maximum) row)
+                   (full (gnus-group-full-name
+                          (format "category.%d" id)
+                          `(nndiscourse ,server))))
+        (gnus-set-active full (cons minimum maximum))
+        (push full groups)))
+    (when-let* ((buffer (and update-buffer (get-buffer gnus-group-buffer))))
+      (with-current-buffer buffer
+        (dolist (group groups)
+          (gnus-group-update-group group nil nil))))))
+
+(defun nndiscourse--finish-background-sync (sync)
+  "Persist the completed background SYNC."
+  (let ((server (nndiscourse--background-sync-server sync))
+        (database (nndiscourse--background-sync-database sync))
+        (errors (nndiscourse--background-sync-errors sync))
+        count)
+    (unwind-protect
+        (if errors
+            (nnheader-message
+             3 "nndiscourse background sync failed: %s"
+             (error-message-string (car errors)))
+          (let ((nndiscourse--database database)
+                (nndiscourse-base-url
+                 (nndiscourse--background-sync-base-url sync)))
+            (nndiscourse--store-categories
+             (nndiscourse--background-sync-categories sync))
+            (if (nndiscourse--background-sync-initial sync)
+                (let ((posts (nndiscourse--background-sync-posts sync)))
+                  (when posts
+                    (nndiscourse--insert-posts posts)
+                    (let ((ids (mapcar #'nndiscourse--post-id posts)))
+                      (nndiscourse--metadata-set "newest_remote_id"
+                                                (seq-max ids))
+                      (nndiscourse--metadata-set "oldest_remote_id"
+                                                (seq-min ids))))
+                  (nndiscourse--metadata-set "initial_sync_complete" "1")
+                  (setq count (length posts)))
+              (let ((updates (nndiscourse--background-sync-updates sync))
+                    (posts (nndiscourse--background-sync-new-posts sync)))
+                (when updates
+                  (nndiscourse--insert-posts updates))
+                (when posts
+                  (nndiscourse--metadata-set
+                   "newest_remote_id"
+                   (seq-max (mapcar #'nndiscourse--post-id posts))))
+                (setq count (length posts))))
+            (setq nndiscourse-status-string
+                  (format "Synchronized %d Discourse posts" count))
+            (nndiscourse--publish-active database server t)
+            (nnheader-message 5 "%s" nndiscourse-status-string)))
+      (sqlite-close database)
+      (remhash server nndiscourse--background-syncs))))
+
+(defun nndiscourse--maybe-finish-background-sync (sync)
+  "Finish SYNC when both categories and posts are complete."
+  (when (and (nndiscourse--background-sync-categories-done sync)
+             (nndiscourse--background-sync-posts-done sync))
+    (nndiscourse--finish-background-sync sync)))
+
+(defun nndiscourse--start-background-sync (server)
+  "Start or return the background synchronization for SERVER."
+  (or (gethash server nndiscourse--background-syncs)
+      (let* ((database (sqlite-open (nndiscourse--database-file server)))
+             (_initialized (nndiscourse--initialize-database database))
+             (nndiscourse--database database)
+             (initial (null (nndiscourse--metadata-get
+                             "initial_sync_complete")))
+             (cursor (string-to-number
+                      (or (nndiscourse--metadata-get "newest_remote_id") "0")))
+             (sync
+              (make-nndiscourse--background-sync
+               :server server :database database
+               :base-url nndiscourse-base-url
+               :auth-type nndiscourse-auth-type
+               :initial initial :cursor cursor
+               :remaining nndiscourse-initial-sync-limit)))
+        (puthash server sync nndiscourse--background-syncs)
+        (nndiscourse--background-get
+         sync "/categories.json?include_subcategories=true"
+         (lambda (data error)
+           (nndiscourse--background-category-result sync data error)))
+        (nndiscourse--background-post-page sync)
+        sync)))
+
 (defun nndiscourse--message-id-for (topic-id post-number)
   "Return the Message-ID for TOPIC-ID and POST-NUMBER."
   (format "<discourse.topic-%d.post-%d@%s>"
@@ -1067,8 +1258,11 @@ Return the refreshed post, falling back to POST on transient errors."
 (deffoo nndiscourse-request-list (&optional server)
   "Insert the active group list for SERVER."
   (nndiscourse--with-report
-    (nndiscourse--possibly-open server)
-    (nndiscourse--sync-categories)
+    (setq server (nndiscourse--possibly-open server))
+    (when (zerop (caar (sqlite-select nndiscourse--database
+                                      "SELECT COUNT(*) FROM categories
+                                        WHERE id > 0")))
+      (nndiscourse--start-background-sync server))
     (with-current-buffer nntp-server-buffer
       (erase-buffer)
       (dolist
@@ -1145,20 +1339,29 @@ Return the refreshed post, falling back to POST on transient errors."
     t))
 
 (deffoo nndiscourse-request-scan (&optional _group server)
-  "Fetch new categories and posts for SERVER."
+  "Start fetching new categories and posts for SERVER."
   (nndiscourse--with-report
-    (nndiscourse--possibly-open server)
-    (nndiscourse--sync-categories)
-    (nnheader-report 'nndiscourse "Synchronized %d posts"
-                     (if (nndiscourse--metadata-get "initial_sync_complete")
-                         (nndiscourse--incremental-sync)
-                       (nndiscourse--initial-sync)))
+    (setq server (nndiscourse--possibly-open server))
+    (nndiscourse--start-background-sync server)
+    (nnheader-report 'nndiscourse "Discourse sync running in background")
     t))
 
 (deffoo nndiscourse-request-group-scan
     (_group &optional server _info)
   "Scan GROUP on SERVER."
   (nndiscourse-request-scan nil server))
+
+(deffoo nndiscourse-retrieve-group-data-early (server infos)
+  "Start background retrieval for SERVER when INFOS is non-nil."
+  (when infos
+    (nndiscourse--start-background-sync
+     (nndiscourse--possibly-open server))))
+
+(deffoo nndiscourse-finish-retrieve-group-infos (server _infos _sync)
+  "Publish cached category ranges for SERVER without waiting for _SYNC."
+  (setq server (nndiscourse--possibly-open server))
+  (nndiscourse--publish-active nndiscourse--database server)
+  t)
 
 (deffoo nndiscourse-retrieve-headers
     (articles &optional group server _fetch-old)

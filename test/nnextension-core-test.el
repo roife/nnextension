@@ -47,6 +47,32 @@
         (should-not (multibyte-string-p (car header)))
         (should-not (multibyte-string-p (cdr header)))))))
 
+(ert-deftest nnextension-core-test-async-json-batch ()
+  (let (completed)
+    (cl-letf
+        (((symbol-function 'url-queue-retrieve)
+          (lambda (url callback &rest _)
+            (let ((buffer
+                   (nnextension-core-test--http-buffer
+                    (if (string-suffix-p "/bad" url) 422 200)
+                    (if (string-suffix-p "/bad" url)
+                        "{\"message\":\"bad query\"}"
+                      (format "{\"url\":%S}" url)))))
+              (with-current-buffer buffer
+                (funcall callback nil))))))
+      (nnextension-core-json-batch
+       '((:key first :method "GET" :url "https://example.test/one")
+         (:key second :method "GET" :url "https://example.test/two")
+         (:key bad :method "GET" :url "https://example.test/bad"
+          :error-message-function
+          (lambda (data fallback) (or (plist-get data :message) fallback))))
+       (lambda (results errors)
+         (setq completed (list results errors)))))
+    (should
+     (equal (plist-get (alist-get 'first (car completed)) :url)
+            "https://example.test/one"))
+    (should (equal (caar (cadr completed)) 'bad))))
+
 (ert-deftest nnextension-core-test-json-errors-and-redaction ()
   (cl-letf (((symbol-function 'url-retrieve-synchronously)
              (lambda (&rest _)

@@ -638,6 +638,29 @@
       (should-error
        (nndiscourse-toggle-like) :type 'user-error))))
 
+(ert-deftest nndiscourse-test-scan-starts-background-sync ()
+  (let ((starts 0))
+    (cl-letf (((symbol-function 'nndiscourse--possibly-open) #'identity)
+              ((symbol-function 'nndiscourse--start-background-sync)
+               (lambda (_server) (cl-incf starts))))
+      (should (nndiscourse-request-scan nil "test"))
+      (should (= starts 1)))))
+
+(ert-deftest nndiscourse-test-early-finish-does-not-wait ()
+  (let ((task 'background-task)
+        (published 0))
+    (cl-letf (((symbol-function 'nndiscourse--possibly-open) #'identity)
+              ((symbol-function 'nndiscourse--start-background-sync)
+               (lambda (_server) task))
+              ((symbol-function 'nndiscourse--publish-active)
+               (lambda (&rest _) (cl-incf published))))
+      (should-not (nndiscourse-retrieve-group-data-early "test" nil))
+      (should
+       (eq (nndiscourse-retrieve-group-data-early "test" '((info))) task))
+      (should
+       (nndiscourse-finish-retrieve-group-infos "test" '((info)) task))
+      (should (= published 1)))))
+
 (provide 'nndiscourse-test)
 
 ;;; nndiscourse-test.el ends here

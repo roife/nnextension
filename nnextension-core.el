@@ -26,11 +26,15 @@
 (require 'sqlite)
 (require 'subr-x)
 (require 'url-http)
+(require 'url-queue)
 
 (defvar url-http-end-of-headers)
 (defvar url-http-response-status)
 
 (define-error 'nnextension-core-http-error "nnextension HTTP error")
+
+(cl-defstruct nnextension-core-batch
+  pending results errors callback done)
 
 (defmacro nnextension-core-with-report (backend &rest body)
   "Run BODY, reporting errors through Gnus BACKEND."
@@ -58,6 +62,31 @@
             (replace-regexp-in-string
              (regexp-quote value) "<redacted>" detail t t)))
     detail))
+
+(defun nnextension-core--parse-json-response
+    (service error-type error-message-function)
+  "Parse the current URL response for SERVICE.
+Signal ERROR-TYPE, using ERROR-MESSAGE-FUNCTION to decode an error body."
+  (let ((status url-http-response-status)
+        parsed)
+    (goto-char url-http-end-of-headers)
+    (skip-chars-forward "\r\n")
+    (unless (eobp)
+      (setq parsed
+            (json-parse-buffer
+             :object-type 'plist
+             :array-type 'list
+             :null-object nil
+             :false-object :false)))
+    (if (and (>= status 200) (< status 300))
+        parsed
+      (let ((fallback (format "%s returned HTTP %s" service status)))
+        (signal
+         error-type
+         (list status
+               (if error-message-function
+                   (funcall error-message-function parsed fallback)
+                 fallback)))))))
 
 (cl-defun nnextension-core-json-request
     (method url
@@ -100,28 +129,84 @@ REQUEST-TARGET replaces URL in user-facing transport errors."
               (list 0 (format "Timed out requesting %s" target))))
     (unwind-protect
         (with-current-buffer buffer
-          (let ((status url-http-response-status)
-                parsed)
-            (goto-char url-http-end-of-headers)
-            (skip-chars-forward "\r\n")
-            (unless (eobp)
-              (setq parsed
-                    (json-parse-buffer
-                     :object-type 'plist
-                     :array-type 'list
-                     :null-object nil
-                     :false-object :false)))
-            (if (and (>= status 200) (< status 300))
-                parsed
-              (let ((fallback (format "%s returned HTTP %s" service status)))
-                (signal
-                 error-type
-                 (list
-                  status
-                  (if error-message-function
-                      (funcall error-message-function parsed fallback)
-                    fallback)))))))
+          (nnextension-core--parse-json-response
+           service error-type error-message-function))
       (kill-buffer buffer))))
+
+(cl-defun nnextension-core-json-request-async
+    (method url callback
+            &key data headers (timeout 30)
+            (error-type 'nnextension-core-http-error)
+            (service "Server") error-message-function sensitive-values)
+  "Retrieve URL with METHOD and call CALLBACK with (DATA ERROR)."
+  (let ((url-request-method method)
+        (url-request-data
+         (and data (encode-coding-string (json-serialize data) 'utf-8)))
+        (url-request-extra-headers
+         (nnextension-core--encode-http-headers
+          (append '(("Accept" . "application/json"))
+                  (and data '(("Content-Type" . "application/json")))
+                  headers))))
+    (setq url-queue-timeout (max url-queue-timeout timeout))
+    (url-queue-retrieve
+     url
+     (lambda (status)
+       (let ((buffer (current-buffer)))
+         (unwind-protect
+             (if-let* ((transport-error (plist-get status :error)))
+               (funcall
+                  callback nil
+                  (list
+                   error-type 0
+                   (nnextension-core--safe-error-detail
+                    transport-error sensitive-values)))
+               (pcase-let
+                   ((`(,data ,error)
+                     (condition-case error
+                         (list
+                          (nnextension-core--parse-json-response
+                           service error-type error-message-function)
+                          nil)
+                       (error (list nil error)))))
+                 (funcall callback data error)))
+           (when (buffer-live-p buffer)
+             (kill-buffer buffer)))))
+     nil t t)))
+
+(defun nnextension-core--batch-result (batch key data error)
+  "Record one DATA or ERROR result for BATCH under KEY."
+  (if error
+      (push (cons key error) (nnextension-core-batch-errors batch))
+    (push (cons key data) (nnextension-core-batch-results batch)))
+  (cl-decf (nnextension-core-batch-pending batch))
+  (when (zerop (nnextension-core-batch-pending batch))
+    (setf (nnextension-core-batch-done batch) t)
+    (funcall (nnextension-core-batch-callback batch)
+             (nreverse (nnextension-core-batch-results batch))
+             (nreverse (nnextension-core-batch-errors batch)))))
+
+(defun nnextension-core-json-batch (requests callback)
+  "Start REQUESTS in parallel and call CALLBACK with (RESULTS ERRORS).
+Each request is a plist containing :key, :method, :url, and options accepted
+by `nnextension-core-json-request-async'."
+  (let ((batch
+         (make-nnextension-core-batch
+          :pending (length requests) :callback callback)))
+    (dolist (request requests)
+      (let ((key (plist-get request :key)))
+        (apply
+         #'nnextension-core-json-request-async
+         (plist-get request :method)
+         (plist-get request :url)
+         (lambda (data error)
+           (nnextension-core--batch-result batch key data error))
+         (cl-loop for (name value) on request by #'cddr
+                  unless (memq name '(:key :method :url))
+                  append (list name value)))))
+    (when (null requests)
+      (setf (nnextension-core-batch-done batch) t)
+      (funcall callback nil nil))
+    batch))
 
 (defun nnextension-core-database-file (directory server)
   "Return the SQLite file in DIRECTORY for virtual SERVER."

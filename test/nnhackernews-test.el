@@ -259,7 +259,10 @@
            (nntp-server-buffer
             (get-buffer-create " *nnhackernews protocol test*")))
       (unwind-protect
-          (cl-letf (((symbol-function 'nnhackernews--possibly-open) #'ignore))
+          (cl-letf
+              (((symbol-function 'nnhackernews--possibly-open) #'identity)
+               ((symbol-function 'nnhackernews--start-background-sync)
+                #'ignore))
             (should (nnhackernews-request-list ""))
             (with-current-buffer nntp-server-buffer
               (goto-char (point-min))
@@ -307,18 +310,32 @@
             (should (= reselects 1)))
         (kill-buffer summary)))))
 
-(ert-deftest nnhackernews-test-group-scan-never-refreshes-comments ()
+(ert-deftest nnhackernews-test-group-scan-starts-background-sync ()
   (nnhackernews-test--with-database
-    (let ((story-scans 0)
+    (let ((background-scans 0)
           (thread-scans 0))
-      (cl-letf (((symbol-function 'nnhackernews--possibly-open) #'ignore)
-                ((symbol-function 'nnhackernews--sync-stories)
-                 (lambda () (cl-incf story-scans) 4))
+      (cl-letf (((symbol-function 'nnhackernews--possibly-open) #'identity)
+                ((symbol-function 'nnhackernews--start-background-sync)
+                 (lambda (_server) (cl-incf background-scans)))
                 ((symbol-function 'nnhackernews--sync-thread)
                  (lambda (&rest _) (cl-incf thread-scans))))
         (should (nnhackernews-request-scan nil ""))
-        (should (= story-scans 1))
+        (should (= background-scans 1))
         (should (= thread-scans 0))))))
+
+(ert-deftest nnhackernews-test-early-finish-does-not-wait ()
+  (let ((task 'background-task)
+        (published 0))
+    (cl-letf (((symbol-function 'nnhackernews--possibly-open) #'identity)
+              ((symbol-function 'nnhackernews--start-background-sync)
+               (lambda (_server) task))
+              ((symbol-function 'nnhackernews--publish-active)
+               (lambda (&rest _) (cl-incf published))))
+      (should-not (nnhackernews-retrieve-group-data-early "" nil))
+      (should
+       (eq (nnhackernews-retrieve-group-data-early "" '((info))) task))
+      (should (nnhackernews-finish-retrieve-group-infos "" '((info)) task))
+      (should (= published 1)))))
 
 (ert-deftest nnhackernews-test-backend-is-read-only ()
   (should (member 'none (cdr (assoc "nnhackernews"

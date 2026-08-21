@@ -42,14 +42,15 @@ server, and subscribe to any of these groups:
 | `show` | Show HN stories |
 | `job` | Job stories |
 
-The initial scan retains the latest 100 roots from each feed by default.
-Customize `nnhackernews-feed-limit` to change that window. Article-number
-mappings are persistent and never change when scores, comment counts, or
-feed positions change.
+Gnus opens immediately from the SQLite cache, then refreshes feed metadata in
+the background with bounded parallel requests. The refresh retains the latest
+100 roots from each feed by default and updates visible Group buffer counts
+when complete. Customize `nnhackernews-feed-limit` to change that window.
+Article-number mappings never change with scores, comments, or feed positions.
 
 Opening a story for the first time downloads its complete comment tree and
 reselects the current Gnus summary so the comments appear as threaded
-articles. Normal Gnus refreshes update story roots but deliberately do not
+articles. Normal Gnus refreshes enqueue a background root refresh but do not
 poll previously opened comment trees. Use `C-c C-r` in a nnhackernews summary
 or article buffer to refresh the current thread manually.
 
@@ -119,6 +120,10 @@ has permission. `nndiscourse-mode` additionally provides:
 The nnextension refactor preserves the existing `nndiscourse-*` public
 variables, commands, backend method, SQLite location, authentication behavior,
 and persistent article numbers.
+
+Discourse categories and posts also load from SQLite first. Network refreshes
+run in the background, fetch categories only once, and update visible Group
+buffer counts after the database transaction completes.
 
 ## Storage
 
