@@ -62,61 +62,38 @@
         (should (equal (plist-get updated :title) "Updated"))
         (should (= (plist-get updated :score) 20))))))
 
-(ert-deftest nnhackernews-test-feed-sync-and-official-fallback ()
+(ert-deftest nnhackernews-test-background-roots-are-persistent ()
   (nnhackernews-test--with-database
-    (let ((nnhackernews-feed-limit 2)
-          fallback-calls)
-      (cl-letf
-          (((symbol-function 'nnhackernews--firebase-request)
-            (lambda (path)
-              (pcase path
-                ("newstories" '(1 2 3 5))
-                ("askstories" '(2))
-                ("showstories" '(3))
-                ("jobstories" '(4))
-                ("item/1"
-                 (push 1 fallback-calls)
-                 '(:id 1 :type "story" :by "fallback"
-                   :time 1787000001 :title "Official fallback"
-                   :score 7 :descendants 0))
-                (_ nil))))
-           ((symbol-function 'nnhackernews--algolia-root-hits)
-            (lambda (group ids)
-              (if (equal group "job")
-                  (list
-                   (nnhackernews-test--story
-                    4 :title "Example is hiring" :tags '("job")))
-                (delq
-                 nil
-                 (mapcar
-                  (lambda (id)
-                    (pcase id
-                      (2 (nnhackernews-test--story
-                          2 :title "Ask HN: Test"
-                          :tags '("story" "ask_hn")))
-                      (3 (nnhackernews-test--story
-                          3 :title "Show HN: Test"
-                          :tags '("story" "show_hn")))
-                      (5 (nnhackernews-test--story 5 :title "Regular"))))
-                  ids))))))
-        (should (= (nnhackernews--sync-stories) 5))
-        (should (equal fallback-calls '(1)))
-        (should
-         (equal
-          (sqlite-select
+    (let* ((feeds '(("news" 1 5) ("ask" 2) ("show" 3) ("job" 4)))
+           (table (make-hash-table :test #'eql)))
+      (dolist
+          (story
+           (list
+            (nnhackernews-test--story 1 :title "Regular one")
+            (nnhackernews-test--story 5 :title "Regular five")
+            (nnhackernews-test--story
+             2 :title "Ask HN: Test" :tags '("story" "ask_hn"))
+            (nnhackernews-test--story
+             3 :title "Show HN: Test" :tags '("story" "show_hn"))
+            (nnhackernews-test--story
+             4 :title "Example is hiring" :tags '("job"))))
+        (puthash (nnhackernews--remote-id story) story table))
+      (should
+       (= (nnhackernews--store-roots
            nnhackernews--database
-           "SELECT id, group_name FROM items ORDER BY id")
-          '((1 "news") (2 "ask") (3 "show") (4 "job") (5 "news"))))
-        (let ((first-number
-               (plist-get (nnhackernews--item-by-id 1) :article-no)))
-          (should (integerp first-number))
-          (nnhackernews--upsert-item
-           '(:id 1 :type "story" :by "fallback" :time 1787000001
-             :title "Updated fallback" :score 8)
-           "news" 1)
-          (should
-           (= (plist-get (nnhackernews--item-by-id 1) :article-no)
-              first-number)))))))
+           (nnhackernews--background-roots feeds table))
+          5))
+      (should
+       (equal
+        (sqlite-select
+         nnhackernews--database
+         "SELECT id, group_name FROM items ORDER BY id")
+        '((1 "news") (2 "ask") (3 "show") (4 "job") (5 "news"))))
+      (let ((article (plist-get (nnhackernews--item-by-id 1) :article-no)))
+        (nnhackernews--upsert-item
+         (nnhackernews-test--story 1 :title "Updated") "news" 1)
+        (should (= (plist-get (nnhackernews--item-by-id 1) :article-no)
+                   article))))))
 
 (ert-deftest nnhackernews-test-paged-comments-use-sparse-references ()
   (nnhackernews-test--with-database
@@ -146,7 +123,7 @@
            (make-nnhackernews--comment-sync
             :server "" :database nnhackernews--database
             :story-id 100 :group "news" :mode 'latest
-            :remaining 1 :page 0 :new-count 0 :touch t)))
+            :remaining 1 :page 0 :new-count 0)))
       (should
        (= (nnhackernews--store-comment-hits
            sync

@@ -94,10 +94,10 @@
 (defvoo nnhackernews--current-group nil)
 (defvoo nnhackernews-status-string "")
 
-(cl-defstruct nnhackernews--background-sync server database feeds)
+(cl-defstruct nnhackernews--background-sync server database)
 
 (cl-defstruct nnhackernews--comment-sync
-  key server database story-id group mode remaining page new-count touch)
+  server database story-id group mode remaining page new-count)
 
 (defvar nnhackernews--background-syncs (make-hash-table :test #'equal))
 (defvar nnhackernews--comment-syncs (make-hash-table :test #'equal))
@@ -121,12 +121,12 @@
 (defconst nnhackernews--item-columns
   '(:id :group-name :article-no :story-id :parent-id :type :author
     :created-at :title :text :url :score :descendants :deleted :dead
-    :fetched-at :thread-fetched-at))
+    :fetched-at))
 
 (defconst nnhackernews--item-select
   "SELECT id, group_name, article_no, story_id, parent_id, type, author,
           created_at, title, text, url, score, descendants, deleted, dead,
-          fetched_at, thread_fetched_at
+          fetched_at
      FROM items WHERE ")
 
 (defvar-keymap nnhackernews-mode-map
@@ -161,7 +161,6 @@
       deleted INTEGER NOT NULL DEFAULT 0,
       dead INTEGER NOT NULL DEFAULT 0,
       fetched_at INTEGER NOT NULL,
-      thread_fetched_at INTEGER,
       UNIQUE(group_name, article_no)
     )")
   (sqlite-execute
@@ -275,10 +274,8 @@
      :deleted (if deleted 1 0)
      :dead (if (eq (plist-get item :dead) t) 1 0))))
 
-(defun nnhackernews--upsert-item
-    (remote group story-id &optional thread-fetched-at)
-  "Insert or update REMOTE in GROUP for STORY-ID.
-THREAD-FETCHED-AT records completion of a root thread download."
+(defun nnhackernews--upsert-item (remote group story-id)
+  "Insert or update REMOTE in GROUP for STORY-ID."
   (let* ((normalized (nnhackernews--normalize-item remote group story-id))
          (id (plist-get normalized :id))
          (existing (and id (nnhackernews--item-by-id id)))
@@ -292,8 +289,8 @@ THREAD-FETCHED-AT records completion of a root thread download."
      "INSERT INTO items
         (id, group_name, article_no, story_id, parent_id, type, author,
          created_at, title, text, url, score, descendants, deleted, dead,
-         fetched_at, thread_fetched_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         fetched_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
         parent_id = excluded.parent_id,
         author = excluded.author,
@@ -305,9 +302,7 @@ THREAD-FETCHED-AT records completion of a root thread download."
         descendants = COALESCE(excluded.descendants, items.descendants),
         deleted = excluded.deleted,
         dead = excluded.dead,
-        fetched_at = excluded.fetched_at,
-        thread_fetched_at = COALESCE(excluded.thread_fetched_at,
-                                     items.thread_fetched_at)"
+        fetched_at = excluded.fetched_at"
      (vector
       id group article-no (plist-get normalized :story-id)
       (plist-get normalized :parent-id) (plist-get normalized :type)
@@ -315,104 +310,17 @@ THREAD-FETCHED-AT records completion of a root thread download."
       (plist-get normalized :title) (plist-get normalized :text)
       (plist-get normalized :url) (plist-get normalized :score)
       (plist-get normalized :descendants) (plist-get normalized :deleted)
-      (plist-get normalized :dead) now thread-fetched-at))
+      (plist-get normalized :dead) now))
     (nnhackernews--item-by-id id)))
-
-(defun nnhackernews--request (url)
-  "Return parsed JSON retrieved from URL."
-  (nnextension-core-json-request
-   "GET" url
-   :headers '(("User-Agent" . "nnextension-nnhackernews/0.1"))
-   :timeout nnhackernews-request-timeout
-   :service "Hacker News"))
-
-(defun nnhackernews--firebase-request (path)
-  "Return parsed Firebase JSON at PATH."
-  (nnhackernews--request (nnhackernews--firebase-url path)))
 
 (defun nnhackernews--firebase-url (path)
   "Return the Firebase URL for PATH."
   (format "%s/%s.json" nnhackernews--firebase-base-url path))
 
-(defun nnhackernews--algolia-request (path &optional query)
-  "Return parsed Algolia JSON at PATH with optional QUERY alist."
-  (nnhackernews--request (nnhackernews--algolia-url path query)))
-
 (defun nnhackernews--algolia-url (path &optional query)
   "Return the Algolia URL for PATH and QUERY."
   (concat nnhackernews--algolia-base-url path
           (and query (concat "?" (url-build-query-string query)))))
-
-(defun nnhackernews--algolia-root-hits (group ids)
-  "Return Algolia root hits for GROUP matching official feed IDS."
-  (if (equal group "job")
-      (plist-get
-       (nnhackernews--algolia-request
-        "/search_by_date"
-        `(("tags" "job")
-          ("hitsPerPage" ,(number-to-string (length ids)))))
-       :hits)
-    (cl-mapcan
-     (lambda (chunk)
-       (plist-get
-        (nnhackernews--algolia-request
-         "/search_by_date"
-         `(("tags"
-            ,(format
-              "story,(%s)"
-              (mapconcat
-               (lambda (id) (format "story_%d" id)) chunk ",")))
-           ("hitsPerPage" ,(number-to-string (length chunk)))))
-        :hits))
-     (seq-partition ids nnhackernews--algolia-batch-size))))
-
-(defun nnhackernews--fetch-root-items (group ids)
-  "Return remote root items for GROUP in official feed IDS order."
-  (let ((by-id (make-hash-table :test #'eql)))
-    (dolist (hit (nnhackernews--algolia-root-hits group ids))
-      (puthash (nnhackernews--remote-id hit) hit by-id))
-    (delq
-     nil
-     (mapcar
-      (lambda (id)
-        (or (gethash id by-id)
-            (nnhackernews--firebase-request (format "item/%d" id))))
-      ids))))
-
-(defun nnhackernews--fetch-news-roots (ids)
-  "Return up to `nnhackernews-feed-limit' ordinary roots from IDS."
-  (cl-loop
-   for chunk in (seq-partition ids nnhackernews--algolia-batch-size)
-   nconc (seq-filter
-          (lambda (root)
-            (equal (nnhackernews--classify-story root "news") "news"))
-          (nnhackernews--fetch-root-items "news" chunk))
-   into roots
-   when (>= (length roots) nnhackernews-feed-limit)
-   return (seq-take roots nnhackernews-feed-limit)
-   finally return roots))
-
-(defun nnhackernews--sync-stories ()
-  "Synchronize current story roots for all Hacker News groups."
-  (let* ((new-ids (nnhackernews--firebase-request "newstories"))
-         (ask-ids (nnhackernews--firebase-request "askstories"))
-         (show-ids (nnhackernews--firebase-request "showstories"))
-         (job-ids (nnhackernews--firebase-request "jobstories"))
-         (special (append ask-ids show-ids job-ids))
-         (feeds
-          `(("ask" . ,(seq-take ask-ids nnhackernews-feed-limit))
-            ("show" . ,(seq-take show-ids nnhackernews-feed-limit))
-            ("job" . ,(seq-take job-ids nnhackernews-feed-limit))))
-         roots)
-    (dolist
-        (root
-         (nnhackernews--fetch-news-roots
-          (seq-remove (lambda (id) (memq id special)) new-ids)))
-      (push (cons "news" root) roots))
-    (dolist (feed feeds)
-      (dolist (root (nnhackernews--fetch-root-items (car feed) (cdr feed)))
-        (push (cons (car feed) root) roots)))
-    (nnhackernews--store-roots nnhackernews--database roots)))
 
 (defun nnhackernews--store-roots (database roots)
   "Store ROOTS in DATABASE and return their count."
@@ -562,7 +470,6 @@ Finish immediately when ERRORS is non-nil."
               ("ask" . ,(seq-take ask nnhackernews-feed-limit))
               ("show" . ,(seq-take show nnhackernews-feed-limit))
               ("job" . ,(seq-take job nnhackernews-feed-limit)))))
-      (setf (nnhackernews--background-sync-feeds sync) feeds)
       (nnextension-core-json-batch
        (nnhackernews--background-root-requests feeds)
        (lambda (root-results root-errors)
@@ -652,13 +559,7 @@ Finish immediately when ERRORS is non-nil."
       (dolist (hit (seq-sort-by #'nnhackernews--remote-id #'< hits))
         (unless (nnhackernews--item-by-id (nnhackernews--remote-id hit))
           (cl-incf new))
-        (nnhackernews--upsert-item hit group story-id))
-      (sqlite-execute
-       database "UPDATE items SET thread_fetched_at = ? WHERE id = ?"
-       (vector (time-convert nil 'integer) story-id)))
-    (when (nnhackernews--comment-sync-touch sync)
-      (nnhackernews--thread-metadata-set
-       database story-id "watched_at" (time-convert nil 'integer)))
+        (nnhackernews--upsert-item hit group story-id)))
     (pcase-let
         ((`(,oldest ,newest)
           (car
@@ -688,7 +589,7 @@ Finish immediately when ERRORS is non-nil."
             (nnhackernews--schedule-reselect group server))
           (nnheader-message 5 "Loaded %d new Hacker News comments" new))
       (sqlite-close database)
-      (remhash (nnhackernews--comment-sync-key sync)
+      (remhash (cons server (nnhackernews--comment-sync-story-id sync))
                nnhackernews--comment-syncs))))
 
 (defun nnhackernews--comment-page-result (sync data error)
@@ -748,10 +649,10 @@ PAGES controls older-page loading.  TOUCH renews local watch state."
                (root (nnhackernews--item-by-id story-id))
                (sync
                 (make-nnhackernews--comment-sync
-                 :key key :server server :database database
+                 :server server :database database
                  :story-id story-id :group (plist-get root :group-name)
                  :mode mode :remaining (or pages 1) :page 0
-                 :new-count 0 :touch touch)))
+                 :new-count 0)))
           (puthash key sync nnhackernews--comment-syncs)
           (when touch
             (nnhackernews--thread-metadata-set
@@ -1061,7 +962,10 @@ PAGES controls older-page loading.  TOUCH renews local watch state."
       (when root-p
         (nnhackernews--start-comment-sync
          server (plist-get item :story-id)
-         (if (plist-get item :thread-fetched-at) 'new 'latest)
+         (if (nnhackernews--comment-cursor
+              nnhackernews--database (plist-get item :story-id) "newest")
+             'new
+           'latest)
          1 t))
       (let* ((header (nnhackernews--make-header item))
              (permalink (nnhackernews--permalink item)))

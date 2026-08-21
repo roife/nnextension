@@ -35,13 +35,23 @@
   (let* ((directory (make-temp-file "nnextension-hn-smoke-" t))
          (nnhackernews-directory directory)
          (file (nnextension-core-database-file directory ""))
-         (nnhackernews--database (sqlite-open file))
+         nnhackernews--database
          (nnhackernews-feed-limit 2)
          story-id roots header comments)
     (unwind-protect
         (progn
-          (nnhackernews--initialize-database nnhackernews--database)
-          (setq roots (nnhackernews--sync-stories)
+          (cl-letf (((symbol-function 'nnhackernews--publish-active) #'ignore))
+            (nnhackernews--start-background-sync "")
+            (url-queue-run-queue)
+            (while (> (hash-table-count nnhackernews--background-syncs) 0)
+              (accept-process-output nil 0.05)
+              (url-queue-run-queue)))
+          (setq nnhackernews--database (sqlite-open file)
+                roots
+                (caar
+                 (sqlite-select
+                  nnhackernews--database
+                  "SELECT COUNT(*) FROM items WHERE type != 'comment'"))
                 story-id
                 (caar
                  (sqlite-select
