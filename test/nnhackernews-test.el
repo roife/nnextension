@@ -36,35 +36,33 @@
   `(:id ,id :type "comment" :author ,author :created_at_i ,time
     :story_id ,story :parent_id ,parent :text ,text :children ,children))
 
-(ert-deftest nnhackernews-test-persistent-numbers-and-classification ()
+(ert-deftest nnhackernews-test-persistent-top-article-numbers ()
   (nnhackernews-test--with-database
-    (let ((news
+    (let ((first
            (nnhackernews--upsert-item
-            (nnhackernews-test--story 101) "news" 101))
-          (ask
+            (nnhackernews-test--story 101) "top" 101))
+          (second
            (nnhackernews--upsert-item
-            (nnhackernews-test--story
-             102 :title "Ask HN: Advice?" :tags '("story" "ask_hn"))
-            "news" 102))
-          (show
+            (nnhackernews-test--story 102 :title "Ask HN: Advice?")
+            "top" 102))
+          (third
            (nnhackernews--upsert-item
             (nnhackernews-test--story 103 :title "Show HN: Tool")
-            "news" 103)))
-      (should (= (plist-get news :article-no) 1))
-      (should (equal (plist-get ask :group-name) "ask"))
-      (should (= (plist-get ask :article-no) 1))
-      (should (equal (plist-get show :group-name) "show"))
+            "top" 103)))
+      (should (= (plist-get first :article-no) 1))
+      (should (= (plist-get second :article-no) 2))
+      (should (= (plist-get third :article-no) 3))
       (let ((updated
              (nnhackernews--upsert-item
               (nnhackernews-test--story 101 :title "Updated" :points 20)
-              "news" 101)))
+              "top" 101)))
         (should (= (plist-get updated :article-no) 1))
         (should (equal (plist-get updated :title) "Updated"))
         (should (= (plist-get updated :score) 20))))))
 
 (ert-deftest nnhackernews-test-background-roots-are-persistent ()
   (nnhackernews-test--with-database
-    (let* ((feeds '(("news" 1 5) ("ask" 2) ("show" 3) ("job" 4)))
+    (let* ((ids '(1 2 3 4 5))
            (table (make-hash-table :test #'eql)))
       (dolist
           (story
@@ -81,30 +79,30 @@
       (should
        (= (nnhackernews--store-roots
            nnhackernews--database
-           (nnhackernews--background-roots feeds table))
+           (nnhackernews--background-roots ids table))
           5))
       (should
        (equal
         (sqlite-select
          nnhackernews--database
          "SELECT id, group_name FROM items ORDER BY id")
-        '((1 "news") (2 "ask") (3 "show") (4 "job") (5 "news"))))
+        '((1 "top") (2 "top") (3 "top") (4 "top") (5 "top"))))
       (let ((article (plist-get (nnhackernews--item-by-id 1) :article-no)))
         (nnhackernews--upsert-item
-         (nnhackernews-test--story 1 :title "Updated") "news" 1)
+         (nnhackernews-test--story 1 :title "Updated") "top" 1)
         (should (= (plist-get (nnhackernews--item-by-id 1) :article-no)
                    article))))))
 
 (ert-deftest nnhackernews-test-paged-comments-use-sparse-references ()
   (nnhackernews-test--with-database
     (nnhackernews--upsert-item
-     (nnhackernews-test--story 100 :comments 2) "news" 100)
+     (nnhackernews-test--story 100 :comments 2) "top" 100)
     (nnhackernews--upsert-item
      (nnhackernews-test--comment 101 100 100 :author nil :text nil)
-     "news" 100)
+     "top" 100)
     (nnhackernews--upsert-item
      (nnhackernews-test--comment 102 100 101 :text "Nested response")
-     "news" 100)
+     "top" 100)
     (let ((root (nnhackernews--item-by-id 100))
           (hidden (nnhackernews--item-by-id 101))
           (nested (nnhackernews--item-by-id 102)))
@@ -118,11 +116,11 @@
 (ert-deftest nnhackernews-test-comment-cursors-drive-dynamic-queries ()
   (nnhackernews-test--with-database
     (nnhackernews--upsert-item
-     (nnhackernews-test--story 100 :comments 2) "news" 100)
+     (nnhackernews-test--story 100 :comments 2) "top" 100)
     (let ((sync
            (make-nnhackernews--comment-sync
             :server "" :database nnhackernews--database
-            :story-id 100 :group "news" :mode 'latest
+            :story-id 100 :group "top" :mode 'latest
             :remaining 1 :page 0 :new-count 0)))
       (should
        (= (nnhackernews--store-comment-hits
@@ -151,7 +149,7 @@
              (nnhackernews-test--story
               100 :title "Safe\r\nInjected"
               :text "<p>Self text</p>" :points 42 :comments 9)
-             "news" 100))
+             "top" 100))
            (header (nnhackernews--make-header item))
            (html (nnhackernews--story-html item)))
       (should (equal (mail-header-subject header) "Safe Injected"))
@@ -168,7 +166,7 @@
   (nnhackernews-test--with-database
     (let* ((root
             (nnhackernews--upsert-item
-             (nnhackernews-test--story 100) "news" 100))
+             (nnhackernews-test--story 100) "top" 100))
            (article (plist-get root :article-no))
            (output (get-buffer-create " *nnhackernews article test*"))
            call)
@@ -180,8 +178,8 @@
             (should
              (equal
               (nnhackernews-request-article
-               article "news" "" output)
-              '("news" . 1)))
+               article "top" "" output)
+              '("top" . 1)))
             (should (equal call '("" 100 latest 1 t)))
             (with-current-buffer output
               (goto-char (point-min))
@@ -192,7 +190,7 @@
         (kill-buffer output)))))
 
 (ert-deftest nnhackernews-test-reselects-the-real-summary-buffer ()
-  (let* ((group "nnhackernews:show")
+  (let* ((group "nnhackernews:top")
          (summary
           (get-buffer-create (gnus-summary-buffer-name group)))
          (reselects 0))
@@ -207,7 +205,7 @@
                ((symbol-function 'gnus-summary-reselect-current-group)
                 (lambda (&rest _) (cl-incf reselects))))
             (let ((gnus-summary-buffer "*Summary*"))
-              (nnhackernews--schedule-reselect "show" "")))
+              (nnhackernews--schedule-reselect "top" "")))
           (should (= reselects 1)))
       (kill-buffer summary))))
 
@@ -215,7 +213,7 @@
   (nnhackernews-test--with-database
     (let* ((root
             (nnhackernews--upsert-item
-             (nnhackernews-test--story 100) "news" 100))
+             (nnhackernews-test--story 100) "top" 100))
            (nntp-server-buffer
             (get-buffer-create " *nnhackernews protocol test*")))
       (unwind-protect
@@ -226,21 +224,19 @@
             (should (nnhackernews-request-list ""))
             (with-current-buffer nntp-server-buffer
               (goto-char (point-min))
-              (should (search-forward "news 1 1 y" nil t))
-              (should (search-forward "job 0 1 y" nil t)))
+              (should (search-forward "top 1 1 y" nil t)))
             (should (nnhackernews-request-list-newsgroups ""))
             (with-current-buffer nntp-server-buffer
               (goto-char (point-min))
-              (should (search-forward "news\tNew Stories" nil t))
-              (should (search-forward "job\tJobs" nil t)))
+              (should (search-forward "top\tTop Stories" nil t)))
             (with-current-buffer nntp-server-buffer
               (erase-buffer)
-              (should (nnhackernews-request-group "news" ""))
-              (should (equal (buffer-string) "211 1 1 1 news\n")))
+              (should (nnhackernews-request-group "top" ""))
+              (should (equal (buffer-string) "211 1 1 1 top\n")))
             (should
              (eq
               (nnhackernews-retrieve-headers
-               (list (plist-get root :article-no)) "news" "")
+               (list (plist-get root :article-no)) "top" "")
               'nov))
             (with-current-buffer nntp-server-buffer
               (goto-char (point-min))
@@ -251,11 +247,11 @@
   (nnhackernews-test--with-database
     (let* ((root
             (nnhackernews--upsert-item
-             (nnhackernews-test--story 100) "news" 100))
+             (nnhackernews-test--story 100) "top" 100))
            call)
       (cl-letf
           (((symbol-function 'nnhackernews--current-location)
-            (lambda () (list "" "news" (plist-get root :article-no) nil)))
+            (lambda () (list "" "top" (plist-get root :article-no) nil)))
            ((symbol-function 'nnhackernews--possibly-open) #'identity)
            ((symbol-function 'nnhackernews--start-comment-sync)
             (lambda (&rest arguments) (setq call arguments))))
@@ -266,11 +262,11 @@
   (nnhackernews-test--with-database
     (let* ((root
             (nnhackernews--upsert-item
-             (nnhackernews-test--story 100) "news" 100))
+             (nnhackernews-test--story 100) "top" 100))
            call)
       (cl-letf
           (((symbol-function 'nnhackernews--current-location)
-            (lambda () (list "" "news" (plist-get root :article-no) nil)))
+            (lambda () (list "" "top" (plist-get root :article-no) nil)))
            ((symbol-function 'nnhackernews--possibly-open) #'identity)
            ((symbol-function 'nnhackernews--start-comment-sync)
             (lambda (&rest arguments) (setq call arguments))))

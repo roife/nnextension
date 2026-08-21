@@ -33,18 +33,15 @@ Add the read-only server to an existing Gnus configuration:
 ```
 
 Run `M-x gnus`, show the server buffer with `^`, browse the nnhackernews
-server, and subscribe to any of these groups:
+server, and subscribe to its single group:
 
 | Group | Contents |
 | --- | --- |
-| `news` | New stories other than Ask HN, Show HN, and jobs |
-| `ask` | Ask HN stories |
-| `show` | Show HN stories |
-| `job` | Job stories |
+| `top` | Stories currently selected by Hacker News `topstories` |
 
 Gnus opens immediately from the SQLite cache, then refreshes feed metadata in
-the background with bounded parallel requests. The refresh retains the latest
-100 roots from each feed by default and updates visible Group buffer counts
+the background with bounded parallel requests. The refresh retains the first
+100 roots from `topstories` by default and updates the visible Group count
 when complete. Customize `nnhackernews-feed-limit` to change that window.
 Article-number mappings never change with scores, comments, or feed positions.
 
