@@ -247,6 +247,25 @@
               (should (search-forward "A useful story" nil t))))
         (kill-buffer nntp-server-buffer)))))
 
+(ert-deftest nnhackernews-test-request-thread-returns-cached-thread ()
+  (nnhackernews-test--with-database
+    (nnhackernews--upsert-item
+     (nnhackernews-test--story 100 :comments 2) "top" 100)
+    (nnhackernews--upsert-item
+     (nnhackernews-test--comment 101 100 100) "top" 100)
+    (let* ((comment
+            (nnhackernews--upsert-item
+             (nnhackernews-test--comment 102 100 101) "top" 100))
+           (header (nnhackernews--make-header comment))
+           headers)
+      (cl-letf (((symbol-function 'nnhackernews--possibly-open) #'identity))
+        (setq headers (nnhackernews-request-thread header "top" "")))
+      (should
+       (equal (mapcar #'mail-header-id headers)
+              '("<100@ycombinator.com>"
+                "<101@ycombinator.com>"
+                "<102@ycombinator.com>"))))))
+
 (ert-deftest nnhackernews-test-manual-refresh-starts-new-comment-load ()
   (nnhackernews-test--with-database
     (let* ((root

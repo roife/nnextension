@@ -21,6 +21,7 @@
 (require 'cl-lib)
 (require 'gnus)
 (require 'gnus-range)
+(require 'mail-parse)
 (require 'nnheader)
 (require 'nnoo)
 (require 'nnextension-core)
@@ -847,6 +848,35 @@ PAGES controls older-page loading.  TOUCH renews local watch state."
                     (header (nnhackernews--make-header item)))
           (nnheader-insert-nov header))))
     'nov))
+
+(deffoo nnhackernews-request-thread (header &optional group server)
+  "Return cached headers in the thread containing HEADER."
+  (nnhackernews--with-report
+    (nnhackernews--possibly-open server)
+    (setq group (or group nnhackernews--current-group))
+    (let* ((article (mail-header-number header))
+           (item
+            (or (and (> article 0)
+                     (nnhackernews--item-by-article group article))
+                (nnhackernews--item-from-message-id
+                 (mail-header-id header))))
+           (story-id (plist-get item :story-id))
+           headers)
+      (unless story-id
+        (error "No cached Hacker News thread for %s"
+               (mail-header-id header)))
+      (dolist
+          (row
+           (sqlite-select
+            nnhackernews--database
+            (concat nnhackernews--item-select
+                    "story_id = ? ORDER BY article_no")
+            (vector story-id)))
+        (when-let* ((cached
+                     (nnhackernews--make-header
+                      (cl-mapcan #'list nnhackernews--item-columns row))))
+          (push cached headers)))
+      (nreverse headers))))
 
 (defun nnhackernews--schedule-summary-update (group server)
   "Schedule insertion of newly cached articles for GROUP on SERVER."
