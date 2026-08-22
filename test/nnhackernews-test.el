@@ -189,11 +189,12 @@
                        "https://example.test/story" nil t))))
         (kill-buffer output)))))
 
-(ert-deftest nnhackernews-test-reselects-the-real-summary-buffer ()
+(ert-deftest nnhackernews-test-updates-the-real-summary-buffer ()
   (let* ((group "nnhackernews:top")
          (summary
           (get-buffer-create (gnus-summary-buffer-name group)))
-         (reselects 0))
+         (updates 0)
+         cache-only)
     (unwind-protect
         (progn
           (with-current-buffer summary
@@ -202,11 +203,14 @@
               (((symbol-function 'run-at-time)
                 (lambda (_time _repeat function &rest arguments)
                   (apply function arguments)))
-               ((symbol-function 'gnus-summary-reselect-current-group)
-                (lambda (&rest _) (cl-incf reselects))))
+               ((symbol-function 'gnus-summary-insert-new-articles)
+                (lambda ()
+                  (setq cache-only nnhackernews--cache-only-scan)
+                  (cl-incf updates))))
             (let ((gnus-summary-buffer "*Summary*"))
-              (nnhackernews--schedule-reselect "top" "")))
-          (should (= reselects 1)))
+              (nnhackernews--schedule-summary-update "top" "")))
+          (should (= updates 1))
+          (should cache-only))
       (kill-buffer summary))))
 
 (ert-deftest nnhackernews-test-gnus-read-protocol ()
@@ -272,6 +276,24 @@
             (lambda (&rest arguments) (setq call arguments))))
         (nnhackernews-fetch-older 3)
         (should (equal call '("" 100 older 3 t)))))))
+
+(ert-deftest nnhackernews-test-fetch-older-reports-exhausted-thread ()
+  (nnhackernews-test--with-database
+    (let ((root
+           (nnhackernews--upsert-item
+            (nnhackernews-test--story 100) "top" 100))
+          message)
+      (cl-letf
+          (((symbol-function 'nnhackernews--current-location)
+            (lambda () (list "" "top" (plist-get root :article-no) nil)))
+           ((symbol-function 'nnhackernews--possibly-open) #'identity)
+           ((symbol-function 'nnhackernews--start-comment-sync) #'ignore)
+           ((symbol-function 'message)
+            (lambda (format-string &rest arguments)
+              (setq message (apply #'format format-string arguments)))))
+        (nnhackernews-fetch-older)
+        (should (equal message
+                       "All older Hacker News comments are already loaded"))))))
 
 (ert-deftest nnhackernews-test-group-scan-starts-background-sync ()
   (nnhackernews-test--with-database

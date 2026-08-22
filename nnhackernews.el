@@ -32,8 +32,7 @@
 
 (declare-function gnus-summary-article-number "gnus-sum")
 (declare-function gnus-summary-buffer-name "gnus-sum" (group))
-(declare-function gnus-summary-reselect-current-group "gnus-sum"
-                  (&optional all no-article))
+(declare-function gnus-summary-insert-new-articles "gnus-sum" ())
 (declare-function gnus-group-update-group "gnus-group"
                   (group &optional visible-only info-unchanged))
 
@@ -98,6 +97,7 @@
 
 (defvar nnhackernews--background-syncs (make-hash-table :test #'equal))
 (defvar nnhackernews--comment-syncs (make-hash-table :test #'equal))
+(defvar nnhackernews--cache-only-scan nil)
 
 (defconst nnhackernews--firebase-base-url
   "https://hacker-news.firebaseio.com/v0")
@@ -500,7 +500,7 @@ Finish immediately when ERRORS is non-nil."
              (error-message-string error))
           (nnhackernews--publish-active database server t)
           (when (> new 0)
-            (nnhackernews--schedule-reselect group server))
+            (nnhackernews--schedule-summary-update group server))
           (nnheader-message 5 "Loaded %d new Hacker News comments" new))
       (sqlite-close database)
       (remhash (cons server (nnhackernews--comment-sync-story-id sync))
@@ -560,24 +560,26 @@ PAGES controls older-page loading.  TOUCH renews local watch state."
                 (nnextension-core-database-file
                  nnhackernews-directory server))))
           (nnhackernews--initialize-database database)
-          (let* ((nnhackernews--database database)
-                 (root (nnhackernews--item-by-id story-id))
-                 (sync
-                  (make-nnhackernews--comment-sync
-                   :server server :database database
-                   :story-id story-id :group (plist-get root :group-name)
-                   :mode mode :remaining (or pages 1) :page 0
-                   :new-count 0)))
-            (puthash key sync nnhackernews--comment-syncs)
+          (let ((nnhackernews--database database))
             (when touch
               (nnhackernews--thread-metadata-set
                database story-id "watched_at" (time-convert nil 'integer)))
             (if (and (eq mode 'older)
                      (nnhackernews--thread-metadata-get
                       database story-id "older_exhausted"))
-                (nnhackernews--finish-comment-sync sync)
-              (nnhackernews--request-comment-page sync))
-            sync)))))
+                (progn
+                  (sqlite-close database)
+                  nil)
+              (let* ((root (nnhackernews--item-by-id story-id))
+                     (sync
+                      (make-nnhackernews--comment-sync
+                       :server server :database database
+                       :story-id story-id :group (plist-get root :group-name)
+                       :mode mode :remaining (or pages 1) :page 0
+                       :new-count 0)))
+                (puthash key sync nnhackernews--comment-syncs)
+                (nnhackernews--request-comment-page sync)
+                sync)))))))
 
 (defun nnhackernews--refresh-watched-threads (server)
   "Refresh recently watched threads for SERVER."
@@ -809,9 +811,10 @@ PAGES controls older-page loading.  TOUCH renews local watch state."
   "Start fetching Hacker News story roots for SERVER."
   (nnhackernews--with-report
     (setq server (nnhackernews--possibly-open server))
-    (nnhackernews--start-background-sync server)
-    (nnhackernews--refresh-watched-threads server)
-    (nnheader-report 'nnhackernews "Hacker News sync running in background")
+    (unless nnhackernews--cache-only-scan
+      (nnhackernews--start-background-sync server)
+      (nnhackernews--refresh-watched-threads server)
+      (nnheader-report 'nnhackernews "Hacker News sync running in background"))
     t))
 
 (deffoo nnhackernews-request-group-scan
@@ -845,8 +848,8 @@ PAGES controls older-page loading.  TOUCH renews local watch state."
           (nnheader-insert-nov header))))
     'nov))
 
-(defun nnhackernews--schedule-reselect (group server)
-  "Schedule a summary reselect for GROUP on SERVER."
+(defun nnhackernews--schedule-summary-update (group server)
+  "Schedule insertion of newly cached articles for GROUP on SERVER."
   (let ((summary
          (get-buffer
           (gnus-summary-buffer-name
@@ -858,7 +861,8 @@ PAGES controls older-page loading.  TOUCH renews local watch state."
          (when (buffer-live-p summary)
            (with-current-buffer summary
              (when (equal (gnus-group-real-name gnus-newsgroup-name) group)
-               (gnus-summary-reselect-current-group t nil)))))))))
+               (let ((nnhackernews--cache-only-scan t))
+                 (gnus-summary-insert-new-articles))))))))))
 
 (deffoo nnhackernews-request-article
     (article &optional group server buffer)
@@ -942,10 +946,11 @@ PAGES controls older-page loading.  TOUCH renews local watch state."
                          (user-error "No cached Hacker News item at point")))
                (pages (max 1 (prefix-numeric-value (or pages 1)))))
     (nnhackernews--possibly-open server)
-    (nnhackernews--start-comment-sync
-     server (plist-get item :story-id) 'older pages t)
-    (message "Loading %d older Hacker News comment page%s in background"
-             pages (if (= pages 1) "" "s"))))
+    (if (nnhackernews--start-comment-sync
+         server (plist-get item :story-id) 'older pages t)
+        (message "Loading %d older Hacker News comment page%s in background"
+                 pages (if (= pages 1) "" "s"))
+      (message "All older Hacker News comments are already loaded"))))
 
 (defun nnhackernews--current-group-p ()
   "Return non-nil when the current Gnus buffer uses nnhackernews."

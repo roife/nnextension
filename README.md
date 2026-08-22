@@ -56,7 +56,13 @@ downloading the complete discussion. Customize
 | `C-c C-r` | Force an incremental refresh of the current thread |
 | `C-c C-o` | Fetch one older comment page for the current thread |
 | `C-u N C-c C-o` | Fetch N older comment pages |
+| `T s` | Expand the current thread when it is collapsed |
+| `/ T` | Limit the summary to the current thread |
 | `/ o` | Show old or read comments already cached by Gnus |
+
+Older comments are inserted into the open Summary buffer when their request
+finishes.  When the complete thread is already cached, `C-c C-o` reports that
+there are no older comments instead of reselecting the group.
 
 Opening a story watches it locally for seven days by default. Normal Gnus
 scans refresh watched threads in the background; customize
