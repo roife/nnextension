@@ -20,9 +20,8 @@ Clone the repository and add it to `load-path`:
 (require 'nnextension)
 ```
 
-`nnextension` loads both backends. Existing configurations may continue to
-load either backend independently with `(require 'nndiscourse)` or
-`(require 'nnhackernews)`.
+`nnextension` loads both backends. Each backend can also be loaded
+independently with `(require 'nndiscourse)` or `(require 'nnhackernews)`.
 
 ## Hacker News
 
@@ -126,10 +125,6 @@ has permission. `nndiscourse-mode` additionally provides:
 | `C-c C-n` | Change the topic notification level |
 | `C-c C-o` | Fetch one or more older pages |
 
-The nnextension refactor preserves the existing `nndiscourse-*` public
-variables, commands, backend method, SQLite location, authentication behavior,
-and persistent article numbers.
-
 Discourse categories and posts also load from SQLite first. Network refreshes
 run in the background, fetch categories only once, and update visible Group
 buffer counts after the database transaction completes.
@@ -139,8 +134,7 @@ buffer counts after the database transaction completes.
 Each backend keeps its own SQLite databases beneath the corresponding Gnus
 directory:
 
-- `nndiscourse-directory` continues to default to
-  `gnus-directory/nndiscourse`;
+- `nndiscourse-directory` defaults to `gnus-directory/nndiscourse`;
 - `nnhackernews-directory` defaults to `gnus-directory/nnhackernews`.
 
 The databases contain public remote content, synchronization metadata, and

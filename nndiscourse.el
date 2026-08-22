@@ -34,10 +34,7 @@
 (require 'auth-source)
 (require 'browse-url)
 (require 'cl-lib)
-(require 'dom)
 (require 'gnus)
-(require 'gnus-int)
-(require 'gnus-msg)
 (require 'gnus-range)
 (require 'gnus-srvr)
 (require 'json)
@@ -49,11 +46,8 @@
 (require 'nnoo)
 (require 'nnextension-core)
 (require 'seq)
-(require 'shr)
 (require 'sqlite)
 (require 'subr-x)
-(require 'url)
-(require 'url-http)
 (require 'url-parse)
 (require 'url-util)
 
@@ -65,9 +59,6 @@
                   (article header))
 (declare-function gnus-group-update-group "gnus-group"
                   (group &optional visible-only info-unchanged))
-
-(defvar url-http-end-of-headers)
-(defvar url-http-response-status)
 
 (defgroup nndiscourse nil
   "Read and write Discourse forums through Gnus."
@@ -192,10 +183,6 @@ Valid values are `auto', `anonymous', `api-key', and `user-api-key'.")
   :lighter " Discourse"
   :keymap nndiscourse-mode-map)
 
-(defun nndiscourse--sanitize-header (value)
-  "Return VALUE without characters that can inject a mail header."
-  (nnextension-core-sanitize-header value))
-
 (defun nndiscourse--normalize-base-url (server)
   "Return the normalized base URL for SERVER."
   (string-trim-right
@@ -205,10 +192,6 @@ Valid values are `auto', `anonymous', `api-key', and `user-api-key'.")
 (defun nndiscourse--server-host ()
   "Return the hostname of the current forum."
   (url-host (url-generic-parse-url nndiscourse-base-url)))
-
-(defun nndiscourse--database-file (server)
-  "Return the database file used for virtual SERVER."
-  (nnextension-core-database-file nndiscourse-directory server))
 
 (defun nndiscourse--initialize-database (database)
   "Create the nndiscourse schema in DATABASE."
@@ -326,12 +309,11 @@ Valid values are `auto', `anonymous', `api-key', and `user-api-key'.")
 
 (defun nndiscourse--configured-servers ()
   "Return configured nndiscourse virtual server names."
-  (delq nil
-        (mapcar
-         (lambda (method)
-           (when (eq (car-safe method) 'nndiscourse)
-             (cadr method)))
-         gnus-secondary-select-methods)))
+  (seq-keep
+   (lambda (method)
+     (when (eq (car-safe method) 'nndiscourse)
+       (cadr method)))
+   gnus-secondary-select-methods))
 
 (defun nndiscourse--read-server ()
   "Read a configured nndiscourse virtual server name."
@@ -387,8 +369,7 @@ Return its standard output as a unibyte string."
                          ""
                        (format ": %s" detail)))))
           output)
-      (when (file-exists-p stderr-file)
-        (delete-file stderr-file)))))
+      (delete-file stderr-file))))
 
 (defun nndiscourse--make-private-key (file)
   "Generate a temporary RSA private key in FILE."
@@ -435,10 +416,6 @@ Return its standard output as a unibyte string."
       ("scopes" "write")
       ("public_key" ,public-key))
     "&")))
-
-(defun nndiscourse--browse-authorization-url (url)
-  "Open authorization URL in an external web browser."
-  (browse-url-with-browser-kind 'external url))
 
 (defun nndiscourse--extract-authorization-payload (input)
   "Extract an encrypted User API Key payload from INPUT."
@@ -537,7 +514,8 @@ back into Emacs, and store the resulting User API Key with auth-source."
     (unwind-protect
         (progn
           (nndiscourse--make-private-key private-key-file)
-          (nndiscourse--browse-authorization-url
+          (browse-url-with-browser-kind
+           'external
            (nndiscourse--authorization-url
             (nndiscourse--public-key private-key-file)
             nonce client-id))
@@ -553,8 +531,7 @@ back into Emacs, and store the resulting User API Key with auth-source."
                 nndiscourse-auth-type 'user-api-key)
           (message "Discourse authorization saved to %s" auth-file)
           auth-file)
-      (when (file-exists-p private-key-file)
-        (delete-file private-key-file)))))
+      (delete-file private-key-file))))
 
 (defun nndiscourse--json-error-message (data fallback)
   "Extract an error message from JSON DATA, or return FALLBACK."
@@ -588,7 +565,7 @@ the request if no credentials are configured."
 
 (defun nndiscourse--category-list (categories)
   "Flatten CATEGORIES and their nested subcategory lists."
-  (cl-mapcan
+  (seq-mapcat
    (lambda (category)
      (cons category
            (nndiscourse--category-list
@@ -962,27 +939,31 @@ When UPDATE-BUFFER is non-nil, redraw existing Group buffer lines."
 (defun nndiscourse--start-background-sync (server)
   "Start or return the background synchronization for SERVER."
   (or (gethash server nndiscourse--background-syncs)
-      (let* ((database (sqlite-open (nndiscourse--database-file server)))
-             (_initialized (nndiscourse--initialize-database database))
-             (nndiscourse--database database)
-             (initial (null (nndiscourse--metadata-get
-                             "initial_sync_complete")))
-             (cursor (string-to-number
-                      (or (nndiscourse--metadata-get "newest_remote_id") "0")))
-             (sync
-              (make-nndiscourse--background-sync
-               :server server :database database
-               :base-url nndiscourse-base-url
-               :auth-type nndiscourse-auth-type
-               :initial initial :cursor cursor
-               :remaining nndiscourse-initial-sync-limit)))
-        (puthash server sync nndiscourse--background-syncs)
-        (nndiscourse--background-get
-         sync "/categories.json?include_subcategories=true"
-         (lambda (data error)
-           (nndiscourse--background-category-result sync data error)))
-        (nndiscourse--background-post-page sync)
-        sync)))
+      (let ((database
+             (sqlite-open
+              (nnextension-core-database-file
+               nndiscourse-directory server))))
+        (nndiscourse--initialize-database database)
+        (let* ((nndiscourse--database database)
+               (initial (null (nndiscourse--metadata-get
+                               "initial_sync_complete")))
+               (cursor
+                (string-to-number
+                 (or (nndiscourse--metadata-get "newest_remote_id") "0")))
+               (sync
+                (make-nndiscourse--background-sync
+                 :server server :database database
+                 :base-url nndiscourse-base-url
+                 :auth-type nndiscourse-auth-type
+                 :initial initial :cursor cursor
+                 :remaining nndiscourse-initial-sync-limit)))
+          (puthash server sync nndiscourse--background-syncs)
+          (nndiscourse--background-get
+           sync "/categories.json?include_subcategories=true"
+           (lambda (data error)
+             (nndiscourse--background-category-result sync data error)))
+          (nndiscourse--background-post-page sync)
+          sync))))
 
 (defun nndiscourse--message-id-for (topic-id post-number)
   "Return the Message-ID for TOPIC-ID and POST-NUMBER."
@@ -1034,26 +1015,15 @@ When UPDATE-BUFFER is non-nil, redraw existing Group buffer lines."
 (defun nndiscourse--subject (post)
   "Return the topic title or a body-derived reply subject for POST."
   (let* ((topic-title
-          (nndiscourse--sanitize-header (plist-get post :topic-title)))
+          (nnextension-core-sanitize-header (plist-get post :topic-title)))
          (body
-          (and (> (or (plist-get post :post-number) 1) 1)
-               (nndiscourse--sanitize-header
+          (and (> (plist-get post :post-number) 1)
+               (nnextension-core-sanitize-header
                 (nndiscourse--body-text post)))))
     (if (string-empty-p (or body ""))
         topic-title
-      (if (> (length body) nndiscourse-reply-subject-length)
-          (let ((excerpt
-                 (string-trim-right
-                  (substring body 0 nndiscourse-reply-subject-length))))
-            (when
-                (and
-                 (string-match
-                  "\\`\\(.+\\)[[:space:]][^[:space:]]*\\'" excerpt)
-                 (> (length (match-string 1 excerpt))
-                    (/ nndiscourse-reply-subject-length 2)))
-              (setq excerpt (match-string 1 excerpt)))
-            (concat excerpt "…"))
-        body))))
+      (truncate-string-to-width
+       body nndiscourse-reply-subject-length nil nil "…"))))
 
 (defun nndiscourse-summary-liked-mark (header)
   "Return a heart when Discourse HEADER is liked by the current user."
@@ -1115,22 +1085,17 @@ Return the refreshed post, falling back to POST on transient errors."
          (nnheader-message
           3 "nndiscourse: using cached post after refresh failure: %s"
           (error-message-string err))
-         post))
-      (error
-       (nnheader-message
-        3 "nndiscourse: using cached post after refresh failure: %s"
-        (error-message-string err))
-       post))))
+         post)))))
 
 (defun nndiscourse--possibly-open (server)
   "Select and, if necessary, open SERVER."
   (let ((server (or server (nnoo-current-server 'nndiscourse))))
     (unless server
       (error "No nndiscourse server selected"))
-    (unless (and (nnoo-current-server-p 'nndiscourse server)
-                 (sqlitep nndiscourse--database))
-      (unless (nndiscourse-open-server server)
-        (error "Could not open nndiscourse server %s" server)))
+    (or (and (nnoo-current-server-p 'nndiscourse server)
+             (sqlitep nndiscourse--database))
+        (nndiscourse-open-server server)
+        (error "Could not open nndiscourse server %s" server))
     server))
 
 (nnoo-define-basics nndiscourse)
@@ -1148,7 +1113,9 @@ Return the refreshed post, falling back to POST on transient errors."
         (unless (sqlitep nndiscourse--database)
           (make-directory nndiscourse-directory t)
           (setq nndiscourse--database
-                (sqlite-open (nndiscourse--database-file server)))
+                (sqlite-open
+                 (nnextension-core-database-file
+                  nndiscourse-directory server)))
           (nndiscourse--initialize-database nndiscourse--database))
         (let ((stored-url (nndiscourse--metadata-get "base_url")))
           (when (and stored-url
@@ -1177,7 +1144,7 @@ Return the refreshed post, falling back to POST on transient errors."
 
 (deffoo nndiscourse-close-server (&optional server _defs)
   "Close SERVER and its database."
-  (when (nndiscourse-server-opened server)
+  (when (sqlitep nndiscourse--database)
     (sqlite-close nndiscourse--database)
     (setq nndiscourse--database nil))
   (nnoo-close-server 'nndiscourse server))
@@ -1395,7 +1362,7 @@ Return the refreshed post, falling back to POST on transient errors."
         (error "Exactly one Discourse category is required"))
       (unless category-id
         (error "Invalid Discourse category %s" group))
-      (let* ((subject (nndiscourse--sanitize-header
+      (let* ((subject (nnextension-core-sanitize-header
                        (mail-decode-encoded-word-string
                         (or (mail-fetch-field "subject") ""))))
              (raw (string-trim-right

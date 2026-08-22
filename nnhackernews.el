@@ -20,10 +20,7 @@
 
 (require 'cl-lib)
 (require 'gnus)
-(require 'gnus-int)
 (require 'gnus-range)
-(require 'gnus-srvr)
-(require 'mail-parse)
 (require 'nnheader)
 (require 'nnoo)
 (require 'nnextension-core)
@@ -327,12 +324,11 @@
 
 (defun nnhackernews--background-roots (ids table)
   "Return top-story IDS found in ID-indexed TABLE."
-  (delq nil
-        (mapcar
-         (lambda (id)
-           (when-let* ((root (gethash id table)))
-             (cons "top" root)))
-         ids)))
+  (seq-keep
+   (lambda (id)
+     (when-let* ((root (gethash id table)))
+       (cons "top" root)))
+   ids))
 
 (defun nnhackernews--publish-active (database server &optional update-buffer)
   "Publish cached group ranges from DATABASE for SERVER.
@@ -448,13 +444,15 @@ Finish immediately when ERRORS is non-nil."
          (database (nnhackernews--comment-sync-database sync))
          (story-id (nnhackernews--comment-sync-story-id sync))
          (cursor
-          (pcase mode
+          (pcase-exhaustive mode
             ('new (nnhackernews--comment-cursor database story-id "newest"))
-            ('older (nnhackernews--comment-cursor database story-id "oldest"))))
+            ('older (nnhackernews--comment-cursor database story-id "oldest"))
+            ('latest nil)))
          (filters
-          (pcase mode
+          (pcase-exhaustive mode
             ('new (and cursor (format "created_at_i>=%d" cursor)))
-            ('older (and cursor (format "created_at_i<%d" cursor)))))
+            ('older (and cursor (format "created_at_i<%d" cursor)))
+            ('latest nil)))
          (query
           `(("tags" ,(format "comment,story_%d" story-id))
             ("hitsPerPage" ,(number-to-string nnhackernews-comment-page-size))
@@ -518,7 +516,7 @@ Finish immediately when ERRORS is non-nil."
            (mode (nnhackernews--comment-sync-mode sync)))
       (cl-incf (nnhackernews--comment-sync-new-count sync)
                (nnhackernews--store-comment-hits sync hits))
-      (pcase mode
+      (pcase-exhaustive mode
         ('new
          (if (< (1+ page) pages)
              (progn
@@ -534,7 +532,7 @@ Finish immediately when ERRORS is non-nil."
          (if (and (> (nnhackernews--comment-sync-remaining sync) 0) hits)
              (nnhackernews--request-comment-page sync)
            (nnhackernews--finish-comment-sync sync)))
-        (_
+        ('latest
          (when (<= pages 1)
            (nnhackernews--thread-metadata-set
             (nnhackernews--comment-sync-database sync)
@@ -557,28 +555,29 @@ Finish immediately when ERRORS is non-nil."
 PAGES controls older-page loading.  TOUCH renews local watch state."
   (let ((key (cons server story-id)))
     (or (gethash key nnhackernews--comment-syncs)
-        (let* ((database
-                (sqlite-open
-                 (nnextension-core-database-file nnhackernews-directory server)))
-               (nnhackernews--database database)
-               (_initialized (nnhackernews--initialize-database database))
-               (root (nnhackernews--item-by-id story-id))
-               (sync
-                (make-nnhackernews--comment-sync
-                 :server server :database database
-                 :story-id story-id :group (plist-get root :group-name)
-                 :mode mode :remaining (or pages 1) :page 0
-                 :new-count 0)))
-          (puthash key sync nnhackernews--comment-syncs)
-          (when touch
-            (nnhackernews--thread-metadata-set
-             database story-id "watched_at" (time-convert nil 'integer)))
-          (if (and (eq mode 'older)
-                   (nnhackernews--thread-metadata-get
-                    database story-id "older_exhausted"))
-              (nnhackernews--finish-comment-sync sync)
-            (nnhackernews--request-comment-page sync))
-          sync))))
+        (let ((database
+               (sqlite-open
+                (nnextension-core-database-file
+                 nnhackernews-directory server))))
+          (nnhackernews--initialize-database database)
+          (let* ((nnhackernews--database database)
+                 (root (nnhackernews--item-by-id story-id))
+                 (sync
+                  (make-nnhackernews--comment-sync
+                   :server server :database database
+                   :story-id story-id :group (plist-get root :group-name)
+                   :mode mode :remaining (or pages 1) :page 0
+                   :new-count 0)))
+            (puthash key sync nnhackernews--comment-syncs)
+            (when touch
+              (nnhackernews--thread-metadata-set
+               database story-id "watched_at" (time-convert nil 'integer)))
+            (if (and (eq mode 'older)
+                     (nnhackernews--thread-metadata-get
+                      database story-id "older_exhausted"))
+                (nnhackernews--finish-comment-sync sync)
+              (nnhackernews--request-comment-page sync))
+            sync)))))
 
 (defun nnhackernews--refresh-watched-threads (server)
   "Refresh recently watched threads for SERVER."
@@ -678,7 +677,7 @@ PAGES controls older-page loading.  TOUCH renews local watch state."
      (unless (string-empty-p (or text ""))
        (concat "<section>" text "</section>\n"))
      "<p>"
-     (when (not (string-empty-p (or external "")))
+     (unless (string-empty-p (or external ""))
        (format "<a href=\"%s\">Open original article</a> · "
                (xml-escape-string external)))
      (format "<a href=\"%s\">View on Hacker News</a></p></article>"
@@ -700,10 +699,10 @@ PAGES controls older-page loading.  TOUCH renews local watch state."
   (let ((server (or server (nnoo-current-server 'nnhackernews))))
     (unless server
       (error "No nnhackernews server selected"))
-    (unless (and (nnoo-current-server-p 'nnhackernews server)
-                 (sqlitep nnhackernews--database))
-      (unless (nnhackernews-open-server server)
-        (error "Could not open nnhackernews server %s" server)))
+    (or (and (nnoo-current-server-p 'nnhackernews server)
+             (sqlitep nnhackernews--database))
+        (nnhackernews-open-server server)
+        (error "Could not open nnhackernews server %s" server))
     server))
 
 (nnoo-define-basics nnhackernews)
@@ -738,7 +737,7 @@ PAGES controls older-page loading.  TOUCH renews local watch state."
 
 (deffoo nnhackernews-close-server (&optional server _defs)
   "Close SERVER and its database."
-  (when (nnhackernews-server-opened server)
+  (when (sqlitep nnhackernews--database)
     (sqlite-close nnhackernews--database)
     (setq nnhackernews--database nil))
   (nnoo-close-server 'nnhackernews server))
@@ -770,9 +769,8 @@ PAGES controls older-page loading.  TOUCH renews local watch state."
     (with-current-buffer nntp-server-buffer
       (erase-buffer)
       (dolist (entry nnhackernews--groups)
-        (pcase-let ((`(,count ,minimum ,maximum)
+        (pcase-let ((`(,_count ,minimum ,maximum)
                      (nnhackernews--group-stats (car entry))))
-          (ignore count)
           (insert (format "%s %d %d y\n"
                           (car entry) maximum minimum)))))
     t))
@@ -868,14 +866,13 @@ PAGES controls older-page loading.  TOUCH renews local watch state."
   (nnhackernews--with-report
     (setq server (nnhackernews--possibly-open server))
     (setq group (or group nnhackernews--current-group))
-    (let* ((item
-            (if (stringp article)
-                (nnhackernews--item-from-message-id article)
-              (nnhackernews--item-by-article group article)))
-           (root-p (and item (equal (plist-get item :type) "story"))))
+    (let ((item
+           (if (stringp article)
+               (nnhackernews--item-from-message-id article)
+             (nnhackernews--item-by-article group article))))
       (unless item
         (error "No such Hacker News article: %s" article))
-      (when root-p
+      (when (equal (plist-get item :type) "story")
         (nnhackernews--start-comment-sync
          server (plist-get item :story-id)
          (if (nnhackernews--comment-cursor

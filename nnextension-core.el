@@ -21,6 +21,7 @@
 (require 'cl-lib)
 (require 'dom)
 (require 'json)
+(require 'message)
 (require 'nnheader)
 (require 'shr)
 (require 'sqlite)
@@ -32,9 +33,6 @@
 (defvar url-http-response-status)
 
 (define-error 'nnextension-core-http-error "nnextension HTTP error")
-
-(cl-defstruct nnextension-core-batch
-  pending results errors callback)
 
 (defmacro nnextension-core-with-report (backend &rest body)
   "Run BODY, reporting errors through Gnus BACKEND."
@@ -169,42 +167,31 @@ REQUEST-TARGET replaces URL in user-facing transport errors."
                           nil)
                        (error (list nil error)))))
                  (funcall callback data error)))
-           (when (buffer-live-p buffer)
-             (kill-buffer buffer)))))
+           (kill-buffer buffer))))
      nil t t)))
-
-(defun nnextension-core--batch-result (batch key data error)
-  "Record one DATA or ERROR result for BATCH under KEY."
-  (if error
-      (push (cons key error) (nnextension-core-batch-errors batch))
-    (push (cons key data) (nnextension-core-batch-results batch)))
-  (cl-decf (nnextension-core-batch-pending batch))
-  (when (zerop (nnextension-core-batch-pending batch))
-    (funcall (nnextension-core-batch-callback batch)
-             (nreverse (nnextension-core-batch-results batch))
-             (nreverse (nnextension-core-batch-errors batch)))))
 
 (defun nnextension-core-json-batch (requests callback)
   "Start REQUESTS in parallel and call CALLBACK with (RESULTS ERRORS).
 Each request is a plist containing :key, :method, :url, and options accepted
 by `nnextension-core-json-request-async'."
-  (let ((batch
-         (make-nnextension-core-batch
-          :pending (length requests) :callback callback)))
-    (dolist (request requests)
-      (let ((key (plist-get request :key)))
-        (apply
-         #'nnextension-core-json-request-async
-         (plist-get request :method)
-         (plist-get request :url)
-         (lambda (data error)
-           (nnextension-core--batch-result batch key data error))
-         (cl-loop for (name value) on request by #'cddr
-                  unless (memq name '(:key :method :url))
-                  append (list name value)))))
-    (when (null requests)
-      (funcall callback nil nil))
-    batch))
+  (if (null requests)
+      (funcall callback nil nil)
+    (let ((pending (length requests)) results errors)
+      (dolist (request requests)
+        (let ((key (plist-get request :key)))
+          (apply
+           #'nnextension-core-json-request-async
+           (plist-get request :method)
+           (plist-get request :url)
+           (lambda (data error)
+             (if error
+                 (push (cons key error) errors)
+               (push (cons key data) results))
+             (when (zerop (cl-decf pending))
+               (funcall callback (nreverse results) (nreverse errors))))
+           (cl-loop for (name value) on request by #'cddr
+                    unless (memq name '(:key :method :url))
+                    append (list name value))))))))
 
 (defun nnextension-core-database-file (directory server)
   "Return the SQLite file in DIRECTORY for virtual SERVER."
@@ -264,12 +251,10 @@ Nodes whose class is in IGNORED-CLASSES are removed before rendering."
 DISPLAY-NAME defaults to USERNAME."
   (let* ((username (nnextension-core-sanitize-header username))
          (display-name
-          (nnextension-core-sanitize-header (or display-name username)))
-         (display-name
-          (if (string-empty-p display-name) username display-name)))
-    (format "\"%s\" <%s@%s>"
-            (replace-regexp-in-string "[\"\\\\]" "\\\\\\&" display-name)
-            username host)))
+          (nnextension-core-sanitize-header (or display-name username))))
+    (message-make-from
+     (if (string-empty-p display-name) username display-name)
+     (format "%s@%s" username host))))
 
 (defun nnextension-core-insert-html-article
     (buffer group header permalink base-url extra-headers body)

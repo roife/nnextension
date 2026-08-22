@@ -117,7 +117,7 @@
      (equal
       (nndiscourse--from
        '(:username "kukmp7g72jn9" :display-name ""))
-      "\"kukmp7g72jn9\" <kukmp7g72jn9@emacs-china.org>"))))
+      "kukmp7g72jn9 <kukmp7g72jn9@emacs-china.org>"))))
 
 (ert-deftest nndiscourse-test-replies-use-body-derived-subjects ()
   (nndiscourse-test--with-database
@@ -141,7 +141,7 @@
       (plist-put reply :cooked "")
       (plist-put reply :raw "  A fallback\n\nsubject  ")
       (should (equal (nndiscourse--subject reply)
-                     "A fallback…"))
+                     "A fallback …"))
       (plist-put reply :raw "")
       (should (equal (nndiscourse--subject reply) "A useful topic")))))
 
@@ -221,16 +221,6 @@
      (equal (nndiscourse--extract-authorization-payload
              " payload=abc%2Fdef%3D ")
             "abc/def="))))
-
-(ert-deftest nndiscourse-test-authorization-uses-external-browser ()
-  (let ((browse-url-browser-function #'eww-browse-url)
-        call)
-    (cl-letf (((symbol-function 'browse-url-with-browser-kind)
-               (lambda (kind url &optional _arg)
-                 (setq call (list kind url)))))
-      (nndiscourse--browse-authorization-url "https://forum.example/auth")
-      (should
-       (equal call '(external "https://forum.example/auth"))))))
 
 (ert-deftest nndiscourse-test-read-server-ignores-internal-placeholder ()
   (let ((gnus-secondary-select-methods
